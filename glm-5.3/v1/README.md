@@ -12,13 +12,14 @@
 
 ## What we started from
 
-| Piece | Source | Link / ID |
-|---|---|---|
-| Engine | **drowzeys'** TensorFold r2 Zig CUDA port for GLM-5.3 (family `glm_moe_dsa`, TensorFold 1.0.7) — the only public full-GLM-5.3 CUDA implementation | branch [`glm53-tp4-2026-10-12-r2`](https://github.com/drowzeys/TensorFold) (tip `00c3bb11`); our worktree: `~/eugr/TensorFold-glm53-r2` |
-| Container image | drowzeys' published serve image (mlx-serve + `libtensorfold_glm53.so` C ABI, AOT toolchain) | `ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-r2-mlx-serve` |
-| Bench methodology + recipes | drowzeys' TP4 recipe repo (bench conditions, receipts we compare against) | [`drowzeys/keys-TensorFold-GLM-5.3-TP4-4x-DGX-Spark`](https://github.com/drowzeys/keys-TensorFold-GLM-5.3-TP4-4x-DGX-Spark) |
-| Model pack | **MikeRoz'** GLM-5.3 EXL3 4.04bpw, h8 head (`GlmMoeDsaForCausalLM`, 76 shards, 360 GB) | [`MikeRoz/GLM-5.3-4.04bpw-h8-exl3`](https://huggingface.co/MikeRoz/GLM-5.3-4.04bpw-h8-exl3) |
-| Drafting sidecars | The pack lacks bf16 `eh_proj.weight` (MTP load) and bf16 `lm_head.weight` (all drafters) — we built the 2.05 GB `model-sidecar-bf16.safetensors` from the pack's own EXL3 tensors via the engine's own reference decoder (`tools/glm53/sidecar.zig`), wired in index-driven with **no engine patch** (findings/findings-sidecars.md) | local artifact; mechanism documented in this dir |
+
+| Piece                       | Source                                                                                                                                                                                                                                                                                                                               | Link / ID                                                                                                                              |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Engine                      | **drowzeys'** TensorFold r2 Zig CUDA port for GLM-5.3 (family `glm_moe_dsa`, TensorFold 1.0.7) — the only public full-GLM-5.3 CUDA implementation                                                                                                                                                                                   | branch[`glm53-tp4-2026-10-12-r2`](https://github.com/drowzeys/TensorFold) (tip `00c3bb11`); our worktree: `~/eugr/TensorFold-glm53-r2` |
+| Container image             | drowzeys' published serve image (mlx-serve +`libtensorfold_glm53.so` C ABI, AOT toolchain)                                                                                                                                                                                                                                           | `ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-r2-mlx-serve`                                                         |
+| Bench methodology + recipes | drowzeys' TP4 recipe repo (bench conditions, receipts we compare against)                                                                                                                                                                                                                                                            | [`drowzeys/keys-TensorFold-GLM-5.3-TP4-4x-DGX-Spark`](https://github.com/drowzeys/keys-TensorFold-GLM-5.3-TP4-4x-DGX-Spark)            |
+| Model pack                  | **MikeRoz'** GLM-5.3 EXL3 4.04bpw, h8 head (`GlmMoeDsaForCausalLM`, 76 shards, 360 GB)                                                                                                                                                                                                                                               | [`MikeRoz/GLM-5.3-4.04bpw-h8-exl3`](https://huggingface.co/MikeRoz/GLM-5.3-4.04bpw-h8-exl3)                                            |
+| Drafting sidecars           | The pack lacks bf16`eh_proj.weight` (MTP load) and bf16 `lm_head.weight` (all drafters) — we built the 2.05 GB `model-sidecar-bf16.safetensors` from the pack's own EXL3 tensors via the engine's own reference decoder (`tools/glm53/sidecar.zig`), wired in index-driven with **no engine patch** (findings/findings-sidecars.md) | local artifact; mechanism documented in this dir                                                                                       |
 
 Starting state: drowzeys' engine had run this model at **TP4 on 4× GB10 only** ("no
 other machine or rank count has been run"), with their 2.75bpw pack. No TP8 serve of
@@ -26,8 +27,7 @@ GLM-5.3 existed anywhere — all TP8 numbers in the wild were extrapolations.
 
 ## What we added
 
-1. **The first world-8 (TP8) serve of this model anywhere** — 8× GB10 (.111–.118),
-   single-rail RoCE (`rocep1s0f1`; rail 1 is down cluster-wide, under investigation).
+1. **The first world-8 (TP8) serve of this model** — 8× GB10
    Boot infrastructure: `start-1m.sh` (the winning 1M-context DSpark serve). Exactness
    gate passes: keyed-seed contract (seed 777 twice → identical `token_sha`, 778 →
    moves), greedy exact, RoCE one-shot collectives verified bit-equal at 3- and
@@ -42,13 +42,7 @@ GLM-5.3 existed anywhere — all TP8 numbers in the wild were extrapolations.
    valid, no recapture). Diff: `zig-dtype-patch.diff`.
 4. **The bf16 drafting sidecars** (above) — drafting unblocked on first boot; MTP
    k=2 worked immediately (60.4% acceptance at first light).
-5. **Standard-bench receipts beating drowzeys' TP4 at every concurrency point** —
-   see RESULTS below. Plus prefill/cache-hit receipts: cold 30,236-token prefill at
-   ~1,440 tok/s (TTFT 21.0 s), cache-hit repeat TTFT 0.03 s.
-6. **The MTP-3 verdict** — k=3 is a net loss vs k=2 at single-stream greedy
-   (−5.7% tok/s; the marginal 3rd draft accepts poorly while each verify round
-   costs ~15% more on bandwidth-bound GB10). k=2 stays the serving config.
-7. **The 8-bit (fp8 e4m3) KV cache for `glm_moe_dsa`** — `TF_GLM53_KV8` (default
+5. **The 8-bit (fp8 e4m3) KV cache for `glm_moe_dsa`** — `TF_GLM53_KV8` (default
    OFF, lossy, gated): e4m3 MLA latent + 2 fp32 scales per token-row, DSA indexer
    keys stay bf16 → **50.6 KiB/token = 53% of bf16**. Staged native quant/dequant
    around **unchanged** Triton kernels — AOT-pack-safe, no recapture. Two bugs
@@ -57,26 +51,12 @@ GLM-5.3 existed anywhere — all TP8 numbers in the wild were extrapolations.
    (`kv8repro`, `zig build kv8repro`) proving staged rows bit-identical and the
    roundtrip clean. Verified live: **~2.4% decode cost, half the cache memory**
    (41.4 vs 42.4 tok/s; 1.58 vs 2.95 GiB/stream at 32K×8). Diff: `patches/zig-kv8.diff`;
-   design + trail: findings/findings-kv8.md.
-8. **THE 900K CONTEXT CEILING at DCP=1** — serving 900,000-token context, decode
-   42.5–42.6 tok/s greedy (equal to 32K bf16 — **zero decode cost at 900K**), with
-   the continuous `drop_caches` technique for the NFS-server page-cache trap on
-   the rank-0/node-0 box (documented in findings/findings/findings-kv8.md). The
-   NVFP4 comparison serve tops out at 450K (dcp2) — we serve 2× their context at
-   DCP=1 with equal decode speed.
-9. **The oracle.py DSpark capture chain** — `TF_GLM53_DSPARK`-gated capture steps
+6. **The oracle.py DSpark capture chain** — `TF_GLM53_DSPARK`-gated capture steps
    that record the drafter's Triton launches (`_group_sums`, `_prep_kernel`,
    `_block_attn_kernel`, …), which neither the window chains nor the static
    enumerator can see; the pack() step now refuses a dspark capture missing its
    drafter kernels. Diff: `patches/oracle-dspark.diff`; findings/findings-dspark-capture.md.
- 10. **The tools-API bench** (`eval/`) — a 10-scenario tools-API probe with honest
-     verdicts (name/args/follow-up checks), mirrored per-request settings against
-     the NVFP4 vLLM endpoint; `tool_bench.py --preset ours|nvfp4` writes the
-     per-endpoint receipts in `results/`. findings/findings-eval-harness.md.
-11. **spark-tools improvements** — exl3 inspect JSON cap 16→256 MiB (it caught the
-    real eh_proj duplicate-name flag), source-manifest Zig-layout support (+4
-    tests), the `glm53-preflight.sh` tripwire (hard-rejects the reserved .11–.18
-    cluster). Doc: `../spark-tools-improvements.md`.
+7.
 
 ## What we borrowed — CREDITS
 
@@ -130,23 +110,21 @@ Building from source (the image's engine layer) and the full image story:
 BUILD-AND-IMAGE.md. The kv8 GPU regression gate lives in the engine worktree:
 `zig build kv8repro` (runs on any single GB10; no model, no engine).
 
-Note on credentials: no API keys or tokens are stored in this repo — the tools
-bench reads its key from the `BENCH_API_KEY` environment variable.
-
 ## RESULTS
 
 All numbers greedy unless noted, thinking ON, 32K ctx, steady-state
 1024-token rounds (the honest measure — see the acceptance warm-up note in
 RESULTS.md). Full logs: RESULTS.md.
 
-**The final config's ladder** (DSpark-original depth 8 + adaptive frows +
+**The final config's ladder** (DSpark depth 8 + adaptive frows +
 CUT_STREAMS=4, kv8, p8 serve — one serve for every concurrency; greedy 1024,
 aggregate tok/s):
 
-| | C1 | C2 | C4 | C8 |
-|---|---|---|---|---|
-| code | **54.5** (t/r 3.11, acc 0.707) | 61.3 | 96.7–97.0 | 130.6 |
-| prose | 43.5 (t/r 1.97) | 56.7 | 78.7 | 111.4 |
+
+|       | C1                             | C2   | C4         | C8    |
+| ----- | ------------------------------ | ---- | ---------- | ----- |
+| code  | **54.5** (t/r 3.11, acc 0.707) | 61.3 | 96.7–97.0 | 130.6 |
+| prose | 43.5 (t/r 1.97)                | 56.7 | 78.7       | 111.4 |
 
 Prose t/r barely moves with concurrency (1.97 at c1 — the 0.3 confidence cut
 trims prose chains below the depth cap everywhere), so the adaptive cap is a
@@ -157,17 +135,18 @@ fixed-prompt shas match the unpatched engine.
 
 **MTP k=2 reference ladder** (the pre-DSpark campaign record):
 
-| | C1 | C2 | C4 | C8 |
-|---|---|---|---|---|
-| prose greedy | 42.0 | 57.7 | 89.5 | 125.7 |
-| code greedy | 47.7 | 64.7 | 108.0 | 144.8 |
-| prose sampled | 41.8 | 57.0 | 78.3 | 93.6 |
-| code sampled | 46.0 | 62.3 | 82.4 | 95.8 |
+
+|               | C1   | C2   | C4    | C8    |
+| ------------- | ---- | ---- | ----- | ----- |
+| prose greedy  | 42.0 | 57.7 | 89.5  | 125.7 |
+| code greedy   | 47.7 | 64.7 | 108.0 | 144.8 |
+| prose sampled | 41.8 | 57.0 | 78.3  | 93.6  |
+| code sampled  | 46.0 | 62.3 | 82.4  | 95.8  |
 
 **vs drowzeys' TP4 published receipts** (their 2.75bpw pack, DFlash2/DSpark
 drafters, sampled): chat C1 38.3 / C2 54.3 / C4 65.6; code C1 41.6 / C2 49.9 /
 C4 62.6 — ours is higher at every point (C1 +15%, C2 +9–24%, C4 +24–37%) with a
-higher-bpw pack, and extends to C8 where they stop at 4 streams. Caveat: drafter
+higher-bpw pack, and extends to C8. Caveat: drafter
 differs (ours MTP k=2, theirs DFlash2/DSpark) — the DSpark-ft2 A/B is the honest
 like-for-like, pending.
 
@@ -192,18 +171,17 @@ TTFT 0.02–0.03 s. The NVFP4 comparison serve: max_model_len 450,000 (dcp2).
 
 **The drafter matrix** (32K ctx, parallel 1, kv8, greedy 1024, ×2 identical):
 
-| drafter | prose tok/s (acc) | code tok/s (acc) |
-|---|---|---|
-| MTP k2 | 42.6 (0.492) | 50.1 (0.700) |
-| MTP k3 | 36.5–38.5 (0.372) | 50.5 (0.605) |
-| MTP k4 | 34.8 (0.290) | 47.5–47.8 (0.515) |
-| MTP k5 | 31.1 (0.234) | 44.3 (0.439) |
-| **DSpark original** | **43.9 (0.626)** | **55.6–55.9 (0.707)** |
-| DSpark ft2 | 43.0–43.2 (0.595) | 54.9–55.0 (0.672) |
+
+| drafter             | prose tok/s (acc)  | code tok/s (acc)       |
+| ------------------- | ------------------ | ---------------------- |
+| MTP k2              | 42.6 (0.492)       | 50.1 (0.700)           |
+| MTP k3              | 36.5–38.5 (0.372) | 50.5 (0.605)           |
+| MTP k4              | 34.8 (0.290)       | 47.5–47.8 (0.515)     |
+| MTP k5              | 31.1 (0.234)       | 44.3 (0.439)           |
+| **DSpark ** | **43.9 (0.626)**   | **55.6–55.9 (0.707)** |
 
 ~~Split verdict~~ — **superseded by the adaptive-frows patch**: the original concurrent
-draft mode capped each stream's drafts by the CONFIGURED parallelism (`min(maxDepth+1,
-32/N)`), so a single stream on a p8 boot got only 3 drafts (c1 code 53.1, t/r 2.72). The
+draft mode capped each stream's drafts by the CONFIGURED parallelism (`min(maxDepth+1, 32/N)`), so a single stream on a p8 boot got only 3 drafts (c1 code 53.1, t/r 2.72). The
 patch (`cuda_multi.zig` `depthOf(which, n_live)`) caps by the round's LIVE stream count
 instead — the curve: 8,8,8,7,5,4,3,3 drafts at 1..8 live streams. With CUT_STREAMS=4
 (the confidence floor engages at ≥4 live streams; =8 dipped c4 by −3.4%), one config now
@@ -222,13 +200,9 @@ Prefill slows with capacity (the kv8 staging + indexer scale with ctx) — the h
 e4m3 only — the rope path is bf16-exact); GPU self-consistency gate `kv8repro` (worst rel
 6.1% = plain e4m3 noise).
 
-**Long-context quality (the 1M serve)**: needle-in-haystack at 845,962 tokens — FOUND,
-twice (cold prefill 2,943 s = 287 tok/s at 826K depth; the cached repeat: prefill 0.5 s,
-wall 2.6 s — the prompt cache held all 845,962 tokens). 100K-context prose/code: cold
-prefill ~751 tok/s, cache-hit eliminates it; gen 38.8–42.0 tok/s at 100K.
+**Long-context quality (the 1M serve)**: needle-in-haystack at 845,962 tokens — FOUND.
+100K-context prose/code:  gen 38.8–42.0 tok/s at 100K.
 
 **The tools-API bench vs the NVFP4 vLLM serve** (10 scenarios, temp 0, thinking ON
 both, identical prompts — eval/results/tools_*.json): both endpoints support the
-OpenAI tools API and pass all 10 scenarios (10/10 ours, 10/10 theirs). On speed at
-identical sampling: ours 2.05x on prose, 1.65x on code — and 2.2x their maximum
-context.
+OpenAI tools API and pass all 10 scenarios (10/10 ours, 10/10 theirs).
