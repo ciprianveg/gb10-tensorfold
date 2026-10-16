@@ -28,25 +28,17 @@ documented in [v1/BUILD-AND-IMAGE.md](v1/BUILD-AND-IMAGE.md).
 ## Quick start
 
 ```bash
-# FAST START — pull the published image (engine + AOT pack baked in, no building):
+# 1. Pull the published image (engine + AOT pack baked in, no building)
 docker pull ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1
-# then boot the cluster with it — see v1/BUILD-AND-IMAGE.md#3-the-runtime-image
-# for the full fast-start docker run (the final v1 config, rank 0 shown there)
 
-# FROM SOURCE (alternative) — build the engine (~30 min, no GPU needed for build/tests)
-# engine branch: glm53-tp8-2026-10-16 (world-8 + kv8 + adaptive frows)
-cd glm-5.3/v1 && ./scripts/build-r2.sh
+# 2. Boot the cluster — the winning serve: 1M-token context, DSpark drafting, kv8
+#    (rank r on node N; rank 0 serves http://127.0.0.1:8080/v1)
+cd glm-5.3/v1 && ./start-1m.sh
 
-# Boot the cluster (rank r on node N; rank 0 serves http://127.0.0.1:8080/v1)
-# The final config: DSpark depth-8, adaptive frows, CUT_STREAMS=4, kv8, 32K×8
-./scripts/glm53-w8-dspark-cut4-boot.sh   # the final config — one serve for everything
-./scripts/glm53-w8-kv8-boot.sh           # base kv8 serve (no drafter)
-# ...or the other variants — see v1/README.md#how-to-reproduce
-
-# Bench it
-./scripts/glm53-bench.sh
+# 3. Watch it come up (~6 min load)
+ssh <head-node> 'docker logs -f glm53-w8-r0'   # wait for "serving glm53-w8 at http://127.0.0.1:8080/v1"
 ```
 
-Weights live on NFS (one copy, seen by all nodes). The drafter needs a direct bind mount.
-The full guide — including the AOT pack capture and the preflight tripwire — is in
-[v1/BUILD-AND-IMAGE.md](v1/BUILD-AND-IMAGE.md) and [v1/README.md](v1/README.md).
+Weights live on NFS (one copy, seen by all nodes). The drafter needs a direct bind mount
+(the script handles it). Building from source instead of pulling the image, the AOT pack
+story, and the load discipline: [v1/BUILD-AND-IMAGE.md](v1/BUILD-AND-IMAGE.md).

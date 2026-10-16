@@ -253,6 +253,6 @@ zig-adaptive-frows.diff; full A/B + gates: findings-adaptive-frows.md.
   graphs captured identically — no extension needed); artifacts distributed +
   md5-verified (generate a187975b..., lib 0d5bb053..., native e1055623...,
   fatbins unchanged).
-- FINAL CONFIG (live serve): ~/dspark-boot-p8-cut4.sh — DSpark-original depth 8,
-  adaptive frows, CUT_STREAMS=4, kv8, 32K x8. One serve for single-stream AND
-  concurrent workloads.
+- FINAL CONFIG: DSpark-original depth 8, adaptive frows, CUT_STREAMS=4, kv8.
+  One serve for single-stream AND concurrent workloads (the repo's start-1m.sh boots
+  this drafter stack at 1M context).

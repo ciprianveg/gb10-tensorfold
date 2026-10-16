@@ -6,15 +6,11 @@ How to reproduce the GLM-5.3 world-8 TensorFold serve on 8× DGX Spark. Three la
 2. **The AOT kernel pack** — pre-captured CUDA kernels per shape/window, bind-mounted
 3. **The runtime image** — the CUDA 13.2 container everything runs inside
 
-## 0. Preflight
+## 0. Cluster layout
 
-```bash
-./scripts/glm53-preflight.sh        # validates CLUSTER_NODES/COPY_HOSTS, checks the pack
-```
-
-The tripwire hard-rejects wrong-cluster configs. Cluster layout: rank r on node N,
-rank 0 (the head) serves `http://127.0.0.1:8080/v1`. Weights on NFS — one copy, every
-node sees it; never copy packs between nodes.
+Rank r on node N; rank 0 (the head) serves `http://127.0.0.1:8080/v1`. Weights on
+NFS — one copy, every node sees it; never copy packs between nodes. The start script
+targets the .111–.118 layout — adjust the IPs for your own cluster.
 
 ## 1. Build the engine (~30 min, no GPU needed, <10 GiB RAM guarded)
 
@@ -26,7 +22,10 @@ Requirements: Zig 0.17 toolchain (aarch64), CUDA toolkit with nvcc, the engine s
 git clone https://github.com/drowzeys/TensorFold && cd TensorFold
 git checkout <r2>            # then apply our branch (see patches/ — or use our fork)
 
-./scripts/build-r2.sh        # 3 stages: fatbins (sm121) → native+lib+generate → host tests
+# 3 stages (RAM-guarded; the watchdog pattern: kill the build tree past ~9 GiB):
+zig build -j4 -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121 -Doptimize=safe fatbins
+zig build -j4 -Dfatbins=zig-out/fatbin -Dsm=121 -Doptimize=safe native glm53-lib tf-glm53-generate
+zig build test               # the host test suite (no GPU needed)
 ```
 
 The build is RAM-guarded (a watchdog kills it past 9 GiB) and runs on any node — no GPU
@@ -105,7 +104,7 @@ Dockerfile in `../docker/Dockerfile`):
 
 ```dockerfile
 FROM ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-r2-mlx-serve
-COPY engine /engine/zig-out   # the built zig-out (from scripts/build-r2.sh)
+COPY engine /engine/zig-out   # the built zig-out (from the section-1 zig build)
 COPY aot /aot                # the AOT pack (aot-world8-32768-dcp1-dspark)
 ENTRYPOINT ["/engine/zig-out/native/bin/tensorfold-native"]
 ```
@@ -128,18 +127,12 @@ base layers match an already-pushed image, the push only uploads your thin layer
 ## 4. Boot the cluster
 
 ```bash
-# rank 0 first (opens the rendezvous port + serves HTTP), then the followers
-./scripts/glm53-w8-boot.sh                  # bf16 cache, undrafted — the base serve
-./scripts/glm53-w8-kv8-boot.sh              # + TF_GLM53_KV8=1 (8-bit KV cache)
-./scripts/glm53-w8-kv8-ceiling-dcp1.sh      # the 900K/1M ceiling (DCP=1 pinned)
-./scripts/glm53-w8-dspark-boot.sh           # + the DSpark drafter (needs the extended pack)
+# THE start — the winning serve: 1M-token context, DSpark depth-8, kv8, DCP=1.
+# Rank 0 first (rendezvous + HTTP), then the followers; the script handles the order.
+./start-1m.sh
 ```
 
-The **final v1 config** (one serve for every concurrency): DSpark-original depth 8,
-adaptive frows, `TF_GLM53_DRAFT_CUT_STREAMS=4`, kv8, 32K×8 — see the README's results
-section for why this exact combination.
-
-Container flags that matter (already in the scripts): `--device /dev/infiniband`,
+Container flags that matter (in the script): `--device /dev/infiniband`,
 `--ulimit memlock=-1`, `--cap-add IPC_LOCK`, `--network host`, and the NCCL RoCE v2 env
 (`NCCL_IB_HCA=rocep1s0f1`, `NCCL_IB_ROCE_VERSION_NUM=2`).
 
@@ -151,13 +144,13 @@ cache refills during the ~400 s load and the cache-fit check fires 2–4 s after
 load-complete. Drop caches on the head every ~8 s *during* the load:
 `sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'`. Workers stay clean (O_DIRECT reads).
 
-## 5. Verify + bench
+## 5. Verify
 
 ```bash
 docker logs -f glm53-w8-r0       # wait for "serving glm53-w8 at http://127.0.0.1:8080/v1"
-./scripts/glm53-bench.sh         # prose + code, c1 + c8 (drowzeys-comparable conditions)
 ```
 
-Expected (greedy, thinking ON, 1024-token rounds, final config):
+Any OpenAI-compatible client works against `http://127.0.0.1:8080/v1`. Expected at the
+32K-concurrency point (greedy, thinking ON, 1024-token rounds, the final drafter config):
 code c1/c2/c4/c8 = **54.5 / 61.3 / 96.7 / 130.6** aggregate tok/s; prose
-**43.5 / 56.7 / 78.7 / 111.4**. Full record: `../RESULTS.md`.
+**43.5 / 56.7 / 78.7 / 111.4**. The tools-API bench: `eval/`. Full record: `../RESULTS.md`.

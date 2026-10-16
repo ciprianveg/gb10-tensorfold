@@ -28,7 +28,7 @@ GLM-5.3 existed anywhere — all TP8 numbers in the wild were extrapolations.
 
 1. **The first world-8 (TP8) serve of this model anywhere** — 8× GB10 (.111–.118),
    single-rail RoCE (`rocep1s0f1`; rail 1 is down cluster-wide, under investigation).
-   Boot infrastructure: the `glm53-w8-boot.sh` family in this directory. Exactness
+   Boot infrastructure: `start-1m.sh` (the winning 1M-context DSpark serve). Exactness
    gate passes: keyed-seed contract (seed 777 twice → identical `token_sha`, 778 →
    moves), greedy exact, RoCE one-shot collectives verified bit-equal at 3- and
    32-row windows.
@@ -108,42 +108,30 @@ are credited where used; the implementation choices and bugs are ours):
 
 ## How to reproduce
 
-Cluster: .111–.118 ONLY (the .11–.18 cluster is reserved — the
-`glm53-preflight.sh` tripwire hard-rejects it). All tool runs load the mission env:
-`--config .env-glm53-tp8` (cluster IPs + master port only, no secrets).
+Cluster: the 8 GB10 nodes (the start script targets .111–.118; adjust the IPs
+in `start-1m.sh` for your own layout). Weights on NFS — one copy, every node sees it.
 
 ```bash
-# 0. Engine build (RAM-guarded 3-stage: fatbins → native+lib+generate → host tests)
-#    worktree: the engine branch glm53-tp8-2026-10-16 (world-8 + kv8 + adaptive frows)
-./scripts/build-r2.sh
+# 1. Pull the published image (engine + AOT pack baked in)
+docker pull ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1
 
-# 1. Tripwire (validates CLUSTER_NODES/COPY_HOSTS, rejects the wrong cluster)
-./scripts/glm53-preflight.sh [--node <ip>]  # also checks the pack (local or via ssh)
+# 2. Boot — THE winning serve: 1M-token context, DSpark depth-8, kv8, DCP=1
+#    (rank r on node N; rank 0 serves 127.0.0.1:8080)
+./start-1m.sh
 
-# 2. Boots (rank r on node N; rank 0 serves 127.0.0.1:8080)
-./scripts/glm53-w8-boot.sh              # bf16 cache, MTP k=2, ctx 32768 — the base serve
-./scripts/glm53-w8-kv8-boot.sh          # + TF_GLM53_KV8=1 (8-bit KV, lossy)
-./scripts/glm53-w8-kv8-ceiling-dcp1.sh  # the 900K ceiling run (kv8, DCP=1 pinned, MTP_DENSE=0)
-./scripts/glm53-w8-k3-boot.sh           # MTP-3 test boot (bf16, k=3 eager shapes)
-./scripts/glm53-w8-dspark-boot.sh       # DSpark drafter A/B (needs the dspark-extended AOT pack)
-./scripts/glm53-w8-dspark-cut4-boot.sh  # THE FINAL CONFIG — DSpark depth 8, adaptive frows,
-                                        #   CUT_STREAMS=4, kv8, 32K x8 — one serve for everything
+# 3. Verify
+ssh <head-node> 'docker logs -f glm53-w8-r0'   # wait for "serving glm53-w8 at http://127.0.0.1:8080/v1"
 
-# 3. Bench (drowzeys-comparable conditions: thinking ON, greedy, 32K ctx)
-./scripts/glm53-bench.sh                # prose + code, c1 + c8
-
-# 4. Tools-API bench (apples-to-apples vs the NVFP4 endpoint; key via BENCH_API_KEY env)
+# 4. Tools-API bench (key via BENCH_API_KEY env — no keys stored in this repo)
 BENCH_API_KEY=<your-key> python3 eval/tool_bench.py --preset ours
-BENCH_API_KEY=<your-key> python3 eval/tool_bench.py --preset nvfp4
 ```
 
-The kv8 GPU regression gate lives in the engine worktree: `zig build kv8repro`
-(runs on any single GB10; no model, no engine).
+Building from source (the image's engine layer) and the full image story:
+BUILD-AND-IMAGE.md. The kv8 GPU regression gate lives in the engine worktree:
+`zig build kv8repro` (runs on any single GB10; no model, no engine).
 
-Note on credentials: the tools bench reads its API key from the `BENCH_API_KEY`
-environment variable — no API keys or tokens are stored in this repo. The
-cluster env file (`.env-glm53-tp8`, not committed) holds private LAN IPs and a
-master port only.
+Note on credentials: no API keys or tokens are stored in this repo — the tools
+bench reads its key from the `BENCH_API_KEY` environment variable.
 
 ## RESULTS
 

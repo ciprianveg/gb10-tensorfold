@@ -19,8 +19,8 @@ vLLM serve's maximum.
 | **GLM-5.3** (EXL3 4.04bpw) | [glm-5.3/v1](glm-5.3/v1/) | **Recommended** — world-8 TP across 8× GB10 (first TP8 GLM-5.3 serve anywhere), 8-bit KV cache (53% memory, ~2.4% cost), DSpark speculative drafting with adaptive per-round draft caps, 1M-token context at DCP=1, needle found at 845,962 tokens |
 
 Each subtree is self-contained: a model page (`glm-5.3/README.md`), the versioned working
-solution (`v1/`), build/boot scripts, engine patches, findings, and bench receipts. Open the
-model page for its full guide.
+solution (`v1/`), a single start script, engine patches, findings, and bench receipts. Open
+the model page for its full guide.
 
 ## Architecture
 
@@ -68,10 +68,10 @@ gb10-tensorfold/
 │   └── v1/                   The world-8 serve (kv8 + DSpark + adaptive frows + 1M ctx)
 │       ├── README.md         The campaign record — what was built, measured, verified
 │       ├── RESULTS.md        The full bench receipts
-│       ├── BUILD-AND-IMAGE.md  Build the engine, pull/build the image, boot the cluster
+│       ├── BUILD-AND-IMAGE.md  Pull the image (or build from source), boot the cluster
 │       ├── findings/         Technical findings (kv8, adaptive frows, AOT, DSpark capture)
 │       ├── patches/          Engine diffs (kv8, adaptive frows, dtype, oracle dspark)
-│       ├── scripts/          Boot / bench / preflight / build scripts
+│       ├── start-1m.sh       THE start script — the winning 1M-context serve
 │       └── eval/             The tools-API bench (harness + receipts)
 ```
 
