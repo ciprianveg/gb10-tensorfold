@@ -13,9 +13,11 @@ speculative drafting, and a **1,000,000-token context**.
 runs **2.05× faster on prose and 1.65× on code** than the equivalent NVFP4 vLLM serve, and
 serves **1M context vs their 450K**. Full receipts: [v1/RESULTS.md](v1/RESULTS.md).
 
-**Image:** [`ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-r2-mlx-serve`](https://github.com/drowzeys/TensorFold/pkgs/container/keys-tensorfold-glm53-tp4-dgx-spark)
-(linux/arm64, sm_121) as the runtime base — the engine binary and AOT kernel pack are
-built from source and bind-mounted. See [v1/BUILD-AND-IMAGE.md](v1/BUILD-AND-IMAGE.md).
+**Image (fast start, no building):**
+[`ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1`](https://github.com/ciprianveg/gb10-tensorfold/pkgs/container/gb10-tensorfold-glm53)
+(linux/arm64, sm_121) — the runtime base + built engine + dspark-extended AOT pack, baked
+and published. The from-source path (drowzeys' base image + bind-mounted engine/pack) is
+documented in [v1/BUILD-AND-IMAGE.md](v1/BUILD-AND-IMAGE.md).
 
 ## Versions
 
@@ -26,19 +28,22 @@ built from source and bind-mounted. See [v1/BUILD-AND-IMAGE.md](v1/BUILD-AND-IMA
 ## Quick start
 
 ```bash
-# 1. Build the engine (any GB10 node; ~30 min, no GPU needed for build/tests)
-#    engine branch: glm53-tp8-2026-10-16 (world-8 + kv8 + adaptive frows)
+# FAST START — pull the published image (engine + AOT pack baked in, no building):
+docker pull ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1
+# then boot the cluster with it — see v1/BUILD-AND-IMAGE.md#3-the-runtime-image
+# for the full fast-start docker run (the final v1 config, rank 0 shown there)
+
+# FROM SOURCE (alternative) — build the engine (~30 min, no GPU needed for build/tests)
+# engine branch: glm53-tp8-2026-10-16 (world-8 + kv8 + adaptive frows)
 cd glm-5.3/v1 && ./scripts/build-r2.sh
 
-# 2. Pull the runtime image on every node (or ship the tar — see BUILD-AND-IMAGE.md)
-docker pull ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-r2-mlx-serve
+# Boot the cluster (rank r on node N; rank 0 serves http://127.0.0.1:8080/v1)
+# The final config: DSpark depth-8, adaptive frows, CUT_STREAMS=4, kv8, 32K×8
+./scripts/glm53-w8-dspark-cut4-boot.sh   # the final config — one serve for everything
+./scripts/glm53-w8-kv8-boot.sh           # base kv8 serve (no drafter)
+# ...or the other variants — see v1/README.md#how-to-reproduce
 
-# 3. Boot the cluster (rank r on node N; rank 0 serves http://127.0.0.1:8080/v1)
-#    The final config: DSpark depth-8, adaptive frows, CUT_STREAMS=4, kv8, 32K×8
-./scripts/glm53-w8-kv8-boot.sh          # base kv8 serve
-# ...or the DSpark variants — see v1/README.md#how-to-reproduce
-
-# 4. Bench it
+# Bench it
 ./scripts/glm53-bench.sh
 ```
 

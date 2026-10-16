@@ -51,8 +51,40 @@ the DSpark extension adds the drafter kernels (164 cubins total).
 
 ## 3. The runtime image
 
-**The tested path** (what v1 runs): the drowzeys published image as the runtime base,
-engine + pack bind-mounted:
+**The fast-start path — no building:** the complete v1 stack (runtime base + built engine +
+dspark-extended AOT pack) is published as a GHCR image:
+
+```
+ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1
+```
+
+```bash
+docker pull ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1
+```
+
+The image bakes in the engine at `/engine` and the AOT pack at `/aot`, with the native
+binary as ENTRYPOINT — so the boot drops the engine/pack bind-mounts entirely (see the
+fast-start block below). Structure-verified (binary runs, pack loads); the bind-mount
+path below remains the cluster-validated reference boot.
+
+**Fast start (the final v1 config, rank 0 shown):**
+
+```bash
+docker run -d --name glm53-w8-r0 --gpus all --network host --ipc host \
+  --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK --memory 110g \
+  -e NCCL_SOCKET_IFNAME=enp1s0f1np1 -e NCCL_IB_HCA=rocep1s0f1 \
+  -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_CROSS_NIC=0 \
+  -v /home/ciprian/models:/root/models:ro \
+  -v /path/to/GLM-5.3-dspark:/dspark:ro \
+  -e TF_GLM53_RANK=0 -e TF_GLM53_WORLD=8 -e TF_GLM53_MASTER=<head-ip>:29581 \
+  -e TF_GLM53_AOT=/aot -e TF_GLM53_HEAD_Q=pack -e TF_GLM53_HCAS=rocep1s0f1 \
+  -e TF_GLM53_KV8=1 -e TF_GLM53_DRAFT_CUT_STREAMS=4 -e TF_GLM53_DSPARK=/dspark \
+  ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1 \
+  serve /root/models/models111/GLM-5.3-4.04bpw-h8-exl3 --name glm53-w8 --context 32768 --parallel 8
+```
+
+**The from-source path** (what v1 was built and validated with): the drowzeys published
+image as the runtime base, engine + pack bind-mounted:
 
 ```bash
 IMG=ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-r2-mlx-serve
@@ -68,13 +100,14 @@ for n in 112 113 114 115 116 117 118; do
 done
 ```
 
-**Bake your own image** (optional — a thin layer on the same base; untested draft):
+**Build the image yourself** (the thin layer — this is how the published one was built;
+Dockerfile in `../docker/Dockerfile`):
 
 ```dockerfile
 FROM ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-r2-mlx-serve
-COPY zig-out /engine/zig-out
-COPY aot-world8-32768-dcp1 /aot
-ENTRYPOINT ["/engine/zig-out/native/bin/tensorfold-native"]
+COPY engine /engine          # the built zig-out (from scripts/build-r2.sh)
+COPY aot /aot                # the AOT pack (aot-world8-32768-dcp1-dspark)
+ENTRYPOINT ["/engine/native/bin/tensorfold-native"]
 ```
 
 ```bash
@@ -89,7 +122,8 @@ docker tag gb10-tensorfold-glm53:v1 ghcr.io/<your-user>/gb10-tensorfold-glm53:v1
 docker push ghcr.io/<your-user>/gb10-tensorfold-glm53:v1
 ```
 
-(GHCR PAT needs `write:packages`. The image is linux/arm64 — build on a GB10.)
+(GHCR PAT needs `write:packages`. The image is linux/arm64 — build on a GB10. If your
+base layers match an already-pushed image, the push only uploads your thin layers.)
 
 ## 4. Boot the cluster
 

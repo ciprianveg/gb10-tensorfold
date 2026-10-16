@@ -40,9 +40,10 @@ model page for its full guide.
   built from source (3-stage RAM-guarded build: fatbins → native+lib → host tests)
 - **Base**: the drowzeys r2 TensorFold GLM-5.3 port (see
   [ATTRIBUTION.md](ATTRIBUTION.md) for the full lineage)
-- **Runtime container**: CUDA 13.2 image (linux/arm64, sm_121) — the engine binary and AOT
-  kernel pack are bind-mounted, not baked in (see the
-  [build & image guide](glm-5.3/v1/BUILD-AND-IMAGE.md))
+- **Runtime container**: [`ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1`](https://github.com/ciprianveg/gb10-tensorfold/pkgs/container/gb10-tensorfold-glm53)
+  (CUDA 13.2, linux/arm64, sm_121) — the fast-start image with the engine + AOT pack
+  baked in; the from-source path is documented in the
+  [build & image guide](glm-5.3/v1/BUILD-AND-IMAGE.md)
 - **Weights**: EXL3 format ([exllamav3](https://github.com/turboderp-org/exllamav3)) via NFS
 - **Drafting**: DSpark block-drafter (RedHatAI speculator base) — one block pass yields all
   8 draft candidates
