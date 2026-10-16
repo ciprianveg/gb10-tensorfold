@@ -105,9 +105,9 @@ Dockerfile in `../docker/Dockerfile`):
 
 ```dockerfile
 FROM ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-r2-mlx-serve
-COPY engine /engine          # the built zig-out (from scripts/build-r2.sh)
+COPY engine /engine/zig-out   # the built zig-out (from scripts/build-r2.sh)
 COPY aot /aot                # the AOT pack (aot-world8-32768-dcp1-dspark)
-ENTRYPOINT ["/engine/native/bin/tensorfold-native"]
+ENTRYPOINT ["/engine/zig-out/native/bin/tensorfold-native"]
 ```
 
 ```bash
