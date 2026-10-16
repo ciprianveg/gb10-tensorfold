@@ -62,10 +62,10 @@ ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1
 docker pull ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1
 ```
 
-The image bakes in the engine at `/engine` and the AOT pack at `/aot`, with the native
-binary as ENTRYPOINT — so the boot drops the engine/pack bind-mounts entirely (see the
-fast-start block below). Structure-verified (binary runs, pack loads); the bind-mount
-path below remains the cluster-validated reference boot.
+The image bakes in the engine at `/engine/zig-out` and the AOT pack at `/aot`, with the
+native binary as ENTRYPOINT — the exact stack that served on the 8-node cluster
+(byte-identical binaries, identical in-container layout), so the boot drops the
+engine/pack bind-mounts entirely (see the fast-start block below).
 
 **Fast start (the final v1 config, rank 0 shown):**
 
