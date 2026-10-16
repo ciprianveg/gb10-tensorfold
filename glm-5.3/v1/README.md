@@ -2,7 +2,8 @@
 
 > **Mission:** the first world-8 (TP8) serve of GLM-5.3 full anywhere — the MikeRoz
 > EXL3 4.04bpw pack on drowzeys' TensorFold r2 Zig engine, distributed across eight
-> GB10 DGX Sparks (.111–.118, single-rail RoCE), plus an 8-bit KV cache that carries
+> GB10 DGX Sparks (.111–.118, single-rail RoCE, 100 Gbit — 200 Gbit should add a
+> small further gain, especially in prefill), plus an 8-bit KV cache that carries
 > it to a 900K-token context at zero decode cost.
 >
 > **Entry point:** this file. Numbers: RESULTS.md. Full technical trail: the

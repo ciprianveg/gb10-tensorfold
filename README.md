@@ -30,6 +30,10 @@ model page for its full guide.
 - **Cluster**: 8 nodes, RoCE v2 (ConnectX-7, 100 Gbit) fabric for NCCL collectives, unified memory
 - **Target arch**: sm_121 (`-Dsm=121` in the Zig build)
 
+> All results in this repo were measured on **100 Gbit** RoCE connectivity. Moving the
+> fabric to **200 Gbit** should provide a small further increase in speed — especially
+> in prefill, where cross-rank bandwidth matters most.
+
 ### Software stack
 
 - **Engine**: [TensorFold](https://github.com/ashhart/TensorFold) — the Zig CUDA server,
