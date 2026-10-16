@@ -57,11 +57,5 @@ published image:
 - **The published fast-start image** — `ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1`:
   the drowzeys runtime base + our built engine + the dspark-extended AOT pack, baked with
   the exact cluster-validated layout
-- **The benches and receipts** — the drafter matrix (MTP k2–k5 + both DSpark drafters),
-  the MTP-3/4/5 net-loss verdicts, the concurrent ladders, the long-context suite, the
-  tools-API bench, and the apples-to-apples speed comparison against the equivalent
-  NVFP4 vLLM serve
-- **Tooling** — spark-tools improvements (exl3 inspect JSON cap, source-manifest
-  Zig-layout support), the `glm53-preflight.sh` cluster tripwire
 
 The implementation choices and bugs are ours; the borrowed designs are credited where used.

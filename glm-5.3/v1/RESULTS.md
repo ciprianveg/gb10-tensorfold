@@ -158,14 +158,13 @@ prompt reuse on, DCP=1.
   k3 = a code-specialist option (+0.8% code, −14% prose). DSpark-ft2/orig pending the capture.
 
 ## THE DRAFTER MATRIX — FINAL (32K, parallel 1, kv8, greedy 1024; all x2 identical)
-| drafter | prose tok/s (acc) | code tok/s (acc) |
-|---|---|---|
-| MTP k2    | 42.6 (0.492) | 50.1 (0.700) |
-| MTP k3    | 36.5-38.5 (0.372) | 50.5 (0.605) |
-| MTP k4    | 34.8 (0.290) | 47.5-47.8 (0.515) |
-| MTP k5    | 31.1 (0.234) | 44.3 (0.439) |
-| DSpark original | **43.9 (0.626)** | **55.6-55.9 (0.707)** |
-| DSpark ft2      | 43.0-43.2 (0.595) | 54.9-55.0 (0.672) |
+| drafter  | prose tok/s (acc) | code tok/s (acc) |
+|----------|---|---|
+| MTP k2   | 42.6 (0.492) | 50.1 (0.700) |
+| MTP k3   | 36.5-38.5 (0.372) | 50.5 (0.605) |
+| MTP k4   | 34.8 (0.290) | 47.5-47.8 (0.515) |
+| MTP k5   | 31.1 (0.234) | 44.3 (0.439) |
+| DSpark   | **43.9 (0.626)** | **55.6-55.9 (0.707)** |
 
 - WINNER: DSpark ORIGINAL (models11/GLM-5.3-dspark — the .11 vLLM solution's drafter) on BOTH
   prose (+3.1% vs k2) and code (+11.6% vs k2). ft2 second. Matches drowzeys' claimed
@@ -187,35 +186,8 @@ prompt reuse on, DCP=1.
 ## THE 1M CEILING — SERVING (2026-10-16, ~05:20)
 - Boot: ctx 1000000, parallel 1, kv8 (50.6 KB/token), DCP=1 PINNED, reserve 3, k=0,
   DSpark-original drafter (222 MiB, direct-mounted), 189 decode graphs, loaded 362s.
-- THE USER'S "1M OR MORE" GOAL: ACHIEVED AT DCP=1 — the fastest architecture, with the
-  matrix-winning drafter. vs the NVFP4 comparison (max_model_len 450000, dcp2): 2.2x their context.
 - The k=0 (no MTP layer) freed the MTP buffers — the pool grew enough for 1M at DCP=1
   (the 900K k2 boot was the memory ceiling with MTP aboard; DSpark removed the constraint).
-
-## LONG-CTX SUITE on the 1M serve (DSpark, kv8, DCP1; log: .111:~/longctx-results.log)
-- 100K prose COLD: prefill 160.9s = 751 tok/s at 100K depth; gen 512 tok @ 38.8 tok/s, acc 0.63.
-- 100K prose CACHE-HIT: prefill 0.0s (120901/120901 cached), wall 13.2s.
-- (code + needle800 x2 appending as they land; the 512-tok gens are all reasoning — the
-  speed numbers are valid, the content samples empty by design of max_tokens.)
-
-## THE MORNING COMPARISON — speed, apples-to-apples (greedy 1024, thinking ON both, same prompts)
-| endpoint | prose tok/s | code tok/s |
-|---|---|---|
-| OURS (EXL3 4.04bpw, TP8, DSpark-original, kv8) | **43.9** | **55.6-55.9** |
-| NVFP4 (their .11 vLLM, TP8/DCP2, fp8 KV, MTP nst3, 450K max) | 21.4 | 33.0-34.2 |
-- ⇒ WE ARE 2.05x FASTER ON PROSE, 1.65x ON CODE than the NVFP4 serve — AND we serve
-  1M context vs their 450K (2.2x). Same model, same sampling, thinking on both.
-
-## THE HAYSTACK — NEEDLE FOUND AT 826K, TWICE (the 1M serve, DSpark, kv8, DCP1)
-- needle800 run1 (COLD): prompt 845,962 tokens, prefill 2943.0s = 287 tok/s at 826K depth
-  (the deep-context rate — the indexer + attention chunks grow with position), gen 79 tok
-  @ 15.6 tok/s (the long-attention decode), NEEDLE FOUND: the model answered exactly
-  "GLM-900K-HIVE". acc 0.72.
-- needle800 run2 (CACHED): prefill 0.5s — the prompt cache held ALL 845,962 tokens —
-  wall 2.6s, gen 37.0 tok/s, NEEDLE FOUND again.
-- ⇒ THE 1M CONTEXT IS REAL: retrieval-accurate at 826K depth, and the prompt cache makes
-  repeat long-context work nearly free. (drowzeys' comparable receipt: needle found at 830K,
-  prefill 2351s on TP4 — ours: 2943s at 845,962 tokens with 2.2x their max context.)
 
 ## THE TOOLS-API BENCH (10 scenarios, temp 0, thinking ON both)
 - Tools API: BOTH SUPPORTED, all scenarios passed (ours 10/10, theirs 10/10) —
@@ -238,21 +210,8 @@ zig-adaptive-frows.diff; full A/B + gates: findings-adaptive-frows.md.
 | c2 code | 62.0 | 61.4 | **61.3** |
 | c4 code | 96.7 | 93.2-93.4 (the regression) | **96.7 / 97.0** |
 | c8 code | 130.4 | 130.4 | **130.6** |
-| c2/c4/c8 prose | — | — | **56.7 / 78.7 / 111.4** (measured on the live CUT4 serve) |
+| c2/c4/c8 prose | — | — | **56.7 / 78.7 / 111.4**|
 
-- c1 CLOSED TO THE P1 PROFILE: t/r 3.11 and acc 0.707 are exactly the p1 serve's
-  drafter-matrix values — the window slice is no longer the limiter; the residual
-  ~2% vs p1's 55.9 is the multi-decoder's per-round host path, not drafting.
-- THE C4 REGRESSION (CUT_STREAMS=8: -3.4%) resolved by CUT_STREAMS=4 — the
-  confidence floor engages at >=4 live streams; c1/c2 keep floor 0.3, c4 recovers.
-- Prose t/r barely moves (1.96->1.97): the 0.3 confidence cut already trims prose
-  chains early — the adaptive cap is a code-workload win, as the matrix predicted.
-- OUTPUT-PRESERVING: fixed-prompt greedy shas MATCH the unpatched engine on both
-  patched boots (prose 75dd870c5ac8ba72, code 2e7afc473225097f).
-- Gates: build rc=0 all 3 stages; host tests 102/102; AOT pack unchanged (400
-  graphs captured identically — no extension needed); artifacts distributed +
-  md5-verified (generate a187975b..., lib 0d5bb053..., native e1055623...,
-  fatbins unchanged).
 - FINAL CONFIG (live serve): ~/dspark-boot-p8-cut4.sh — DSpark-original depth 8,
   adaptive frows, CUT_STREAMS=4, kv8, 32K x8. One serve for single-stream AND
   concurrent workloads.
