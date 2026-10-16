@@ -15,7 +15,8 @@ Spark. This project builds directly on their work:
 - The TP4 recipe repo and bench methodology (our bench conditions mirror theirs for
   comparability)
 - The published serve image (`ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark`) —
-  we use it as the runtime base unchanged
+  the runtime base of our `ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1` image, which
+  adds our built engine and AOT kernel pack on top
 - The DSpark **ft2 fine-tune** of the RedHatAI speculator
 - The nemotron in-tree fp8 precedent inside TensorFold
 
