@@ -1,0 +1,121 @@
+{
+  "endpoint": "nvfp4 (vLLM NVFP4 TP8 DCP2)",
+  "model": "GLM-5.3-NVFP4",
+  "smoke": false,
+  "sampling": {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "seed": 42
+  },
+  "tools_api_verdict": "supported",
+  "scenarios": [
+    {
+      "id": "t01",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}",
+      "args_verdict": "args match",
+      "followup_content_head": "the current weather in paris is:\n\n- **temperature:** 18\u00b0c\n- **conditions:** light rain\n- **wind:** 12 km/h\n\nit's a mild but slightly rainy day, so you might wan"
+    },
+    {
+      "id": "t02",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "get_weather",
+      "arguments": "{\"city\": \"Tokyo\"}",
+      "args_verdict": "args match",
+      "followup_content_head": "the current weather in tokyo is:\n\n- **temperature:** 27\u00b0c\n- **conditions:** sunny\n- **wind:** no wind\n\nit's a beautiful, calm day in tokyo! \u2600\ufe0f"
+    },
+    {
+      "id": "t03",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "calculator",
+      "arguments": "{\"expression\": \"27*43\"}",
+      "args_verdict": "args match",
+      "followup_content_head": "27 * 43 = **1161**"
+    },
+    {
+      "id": "t04",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "lookup_capital",
+      "arguments": "{\"country\": \"France\"}",
+      "args_verdict": "args match",
+      "followup_content_head": "the capital of france is **paris**."
+    },
+    {
+      "id": "t05",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "get_stock_price",
+      "arguments": "{\"ticker\": \"AAPL\"}",
+      "args_verdict": "args match",
+      "followup_content_head": "the latest price of apple stock (aapl) is **$227.50**, up 0.8% today."
+    },
+    {
+      "id": "t06",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "convert_currency",
+      "arguments": "{\"amount\": 250, \"from_currency\": \"USD\", \"to_currency\": \"EUR\"}",
+      "args_verdict": "args match",
+      "followup_content_head": "250 us dollars converts to **229.50 euros** at an exchange rate of 0.918."
+    },
+    {
+      "id": "t07",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "search_flights",
+      "arguments": "{\"date\": \"2026-11-01\", \"destination\": \"LAX\", \"origin\": \"JFK\"}",
+      "args_verdict": "args match",
+      "followup_content_head": "i found 3 flights from jfk to lax on 2026-11-01. here's a summary:\n\n- **total flights found:** 3\n- **cheapest option:** $312\n- **nonstop flight duration:** 5 ho"
+    },
+    {
+      "id": "t08",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "get_current_time",
+      "arguments": "{\"timezone\": \"Europe/Berlin\"}",
+      "args_verdict": "args match",
+      "followup_content_head": "it's currently **14:35** (2:35 pm) on **tuesday** in berlin."
+    },
+    {
+      "id": "t09",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "calculate_bmi",
+      "arguments": "{\"height_m\": 1.75, \"weight_kg\": 70}",
+      "args_verdict": "args match",
+      "followup_content_head": "the bmi of someone who weighs 70 kg and is 1.75 m tall is **22.86**, which falls within the **normal weight range** (18.5\u201324.9)."
+    },
+    {
+      "id": "t10",
+      "name_ok": true,
+      "args_ok": true,
+      "followup_ok": true,
+      "called": "get_movie_release_year",
+      "arguments": "{\"title\": \"Inception\"}",
+      "args_verdict": "args match",
+      "followup_content_head": "inception was released in **2010**. it was directed by christopher nolan."
+    }
+  ],
+  "summary": {
+    "probe": "supported",
+    "scenarios": 10,
+    "name_ok": 10,
+    "args_ok": 10,
+    "followup_ok": 10,
+    "full_pass": 10
+  }
+}

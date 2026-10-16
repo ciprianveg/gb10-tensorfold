@@ -1,0 +1,117 @@
+--- zig/src/families/glm_moe_dsa/cuda_weights.zig.bak	2026-10-15 16:04:50.773657786 +0300
++++ zig/src/families/glm_moe_dsa/cuda_weights.zig	2026-10-15 16:06:00.468770835 +0300
+@@ -25,6 +25,18 @@
+ 
+ const Tensor = core.checkpoint.Tensor;
+ const config_max_layers = @import("config.zig").max_layers;
++
++/// One-time log latches for the fp16 -> bf16 round casts (the 4.04bpw-h8 pack stores the
++/// bf-named non-scale tensors as fp16; the loader is single-threaded per rank process).
++const RoundCastLogged = struct {
++    var kv_b: bool = false;
++    var gate: bool = false;
++    var idx_wk: bool = false;
++    var idx_weights_proj: bool = false;
++    var idx_k_norm_w: bool = false;
++    var idx_k_norm_b: bool = false;
++};
++
+ pub const Experts = kern.Experts;
+ 
+ pub const Mlp = struct { gate: exl3.Linear, up: exl3.Linear, down: exl3.Linear };
+@@ -364,6 +376,31 @@
+         return L.put(key, out);
+     }
+ 
++    /// weights.as_bf16 with the capture-side round cast: bf16 as stored; fp16 round-to-nearest-even
++    /// to bf16 (bf16Bits — torch's .to(bfloat16), the exact values the world-8 AOT capture compiled
++    /// against). For the bf-named tensors the 4.04bpw-h8 pack stores as fp16 (router gate, indexer
++    /// wk / weights_proj / k_norm). Logs once per class per process.
++    fn bf16Round(L: *Loader, name: []const u8, key: []const u8, latch: *bool, class: []const u8) !u64 {
++        const t = try L.get(name);
++        if (t.dtype == .bf16) {
++            var shape: [core.safetensors.max_rank]usize = undefined;
++            return L.put(key, try L.part(name, &shape));
++        }
++        if (t.dtype != .f16) return error.UnexpectedTensor;
++        var shape: [core.safetensors.max_rank]usize = undefined;
++        const raw = try L.part(name, &shape);
++        const out = try staging(&L.host, L.gpa, raw.len);
++        for (0..raw.len / 2) |i| {
++            const h: f16 = @bitCast(std.mem.readInt(u16, raw[2 * i ..][0..2], .little));
++            std.mem.writeInt(u16, out[2 * i ..][0..2], bf16Bits(@as(f32, h)), .little);
++        }
++        if (!latch.*) {
++            std.log.info("glm53: {s}: fp16 storage -> bf16 round cast (torch .to(bfloat16); the AOT capture compiled these values)", .{class});
++            latch.* = true;
++        }
++        return L.put(key, out);
++    }
++
+     /// `.float()` of a bf16 / fp32 vector (the router's score-correction bias).
+     fn f32vec(L: *Loader, name: []const u8, key: []const u8) !u64 {
+         const t = try L.get(name);
+@@ -442,7 +479,8 @@
+     /// fused.Weights: kv_b [H (nope + v), kv_lora] -> wk [H, nope, kv_lora] and wv [H, v, kv_lora], contiguous.
+     fn kvB(L: *Loader, name: []const u8, key: []const u8, c: Config, heads: usize) ![2]u64 {
+         const t = try L.get(name);
+-        if (t.dtype != .bf16) return error.UnexpectedTensor;
++        // the 4.04bpw-h8 pack stores kv_b_proj as fp16: accepted with the capture-side round cast
++        if (t.dtype != .bf16 and t.dtype != .f16) return error.UnexpectedTensor;
+         var shape: [core.safetensors.max_rank]usize = undefined;
+         const raw = try L.part(name, &shape);
+         const per = c.nope + c.v_dim;
+@@ -458,9 +496,28 @@
+         }
+         const wk = try staging(&L.host, L.gpa, heads * c.nope * row);
+         const wv = try staging(&L.host2, L.gpa, heads * c.v_dim * row);
++        const f16in = t.dtype == .f16;
+         for (0..heads) |h| {
+-            @memcpy(wk[h * c.nope * row ..][0 .. c.nope * row], src[h * per * row ..][0 .. c.nope * row]);
+-            @memcpy(wv[h * c.v_dim * row ..][0 .. c.v_dim * row], src[(h * per + c.nope) * row ..][0 .. c.v_dim * row]);
++            if (f16in) {
++                // fp16 storage: round-cast per element while splitting the blocks (bf16Bits = torch .to(bfloat16),
++                // the values the AOT capture compiled; byte layout is identical, only the element decode differs)
++                for (0..c.nope * c.kv_lora) |i| {
++                    const v: f16 = @bitCast(std.mem.readInt(u16, src[(h * per * c.kv_lora + i) * 2 ..][0..2], .little));
++                    std.mem.writeInt(u16, wk[(h * c.nope * c.kv_lora + i) * 2 ..][0..2], bf16Bits(@as(f32, v)), .little);
++                }
++                const off = (h * per + c.nope) * c.kv_lora;
++                for (0..c.v_dim * c.kv_lora) |i| {
++                    const v: f16 = @bitCast(std.mem.readInt(u16, src[(off + i) * 2 ..][0..2], .little));
++                    std.mem.writeInt(u16, wv[(h * c.v_dim * c.kv_lora + i) * 2 ..][0..2], bf16Bits(@as(f32, v)), .little);
++                }
++            } else {
++                @memcpy(wk[h * c.nope * row ..][0 .. c.nope * row], src[h * per * row ..][0 .. c.nope * row]);
++                @memcpy(wv[h * c.v_dim * row ..][0 .. c.v_dim * row], src[(h * per + c.nope) * row ..][0 .. c.v_dim * row]);
++            }
++        }
++        if (f16in and !RoundCastLogged.kv_b) {
++            std.log.info("glm53: self_attn.kv_b_proj.weight: fp16 storage -> bf16 round cast (torch .to(bfloat16); the AOT capture compiled these values)", .{});
++            RoundCastLogged.kv_b = true;
+         }
+         var kb: [128]u8 = undefined;
+         const a = try L.put(try std.fmt.bufPrint(&kb, "{s}.wk", .{key}), wk);
+@@ -872,17 +929,17 @@
+         if (L.has(try at.n(&nb, p, "self_attn.indexer.wq_b.trellis"))) {
+             out.indexer = .{
+                 .wq_b = try L.linear(try at.n(&nb, p, "self_attn.indexer.wq_b"), try at.n(&kb, key, "wq_b")),
+-                .wk = try L.bf16(try at.n(&nb, p, "self_attn.indexer.wk.weight"), try at.n(&kb, key, "idx.wk")),
+-                .weights_proj = try L.bf16(try at.n(&nb, p, "self_attn.indexer.weights_proj.weight"), try at.n(&kb, key, "idx.weights_proj")),
+-                .k_norm_w = try L.bf16(try at.n(&nb, p, "self_attn.indexer.k_norm.weight"), try at.n(&kb, key, "idx.k_norm_w")),
+-                .k_norm_b = try L.bf16(try at.n(&nb, p, "self_attn.indexer.k_norm.bias"), try at.n(&kb, key, "idx.k_norm_b")),
++                .wk = try L.bf16Round(try at.n(&nb, p, "self_attn.indexer.wk.weight"), try at.n(&kb, key, "idx.wk"), &RoundCastLogged.idx_wk, "self_attn.indexer.wk.weight"),
++                .weights_proj = try L.bf16Round(try at.n(&nb, p, "self_attn.indexer.weights_proj.weight"), try at.n(&kb, key, "idx.weights_proj"), &RoundCastLogged.idx_weights_proj, "self_attn.indexer.weights_proj.weight"),
++                .k_norm_w = try L.bf16Round(try at.n(&nb, p, "self_attn.indexer.k_norm.weight"), try at.n(&kb, key, "idx.k_norm_w"), &RoundCastLogged.idx_k_norm_w, "self_attn.indexer.k_norm.weight"),
++                .k_norm_b = try L.bf16Round(try at.n(&nb, p, "self_attn.indexer.k_norm.bias"), try at.n(&kb, key, "idx.k_norm_b"), &RoundCastLogged.idx_k_norm_b, "self_attn.indexer.k_norm.bias"),
+             };
+         }
+         out.router_w = 0;
+         out.router_bias = 0;
+         out.experts = null;
+         if (c.isMoe(i)) {
+-            out.router_w = try L.bf16(try at.n(&nb, p, "mlp.gate.weight"), try at.n(&kb, key, "router.weight"));
++            out.router_w = try L.bf16Round(try at.n(&nb, p, "mlp.gate.weight"), try at.n(&kb, key, "router.weight"), &RoundCastLogged.gate, "mlp.gate.weight");
+             out.router_bias = try L.f32vec(try at.n(&nb, p, "mlp.gate.e_score_correction_bias"), try at.n(&kb, key, "router.bias"));
+             out.experts = try L.experts(i, key, c);
+             out.mlp = try L.mlp(try at.n(&nb, p, "mlp.shared_experts"), try at.n(&kb, key, "mlp"));

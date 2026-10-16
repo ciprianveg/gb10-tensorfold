@@ -1,0 +1,126 @@
+--- /home/ciprian/eugr/TensorFold-glm53-r2/tools/glm53/oracle.py.bak	2026-10-15 23:11:37.975019395 +0300
++++ /home/ciprian/eugr/TensorFold-glm53-r2/tools/glm53/oracle.py	2026-10-15 23:16:18.629520453 +0300
+@@ -20,9 +20,19 @@
+ 
+ ``--record``: tools/zig/triton_aot_manifest.py's Recorder logs every Triton specialization and EXL3 extension call;
+ at the end the manifest and aot_pack.py turn the Triton cache into aot.json + cubins/ (the kernel set the Zig engine
+-loads). ``--fixtures``: per window, each layer's output rows, cache rows written, selections and end-of-layer
++loads). ``--fixtures``: per window, each layer's output rows, cache rows, selections and end-of-layer
+ scratch (diagnostics) as safetensors, plus meta.json (frozen env, tiles, versions, weight digests).
+ 
++``TF_GLM53_DSPARK=<dir>`` (the DSpark drafter's checkpoint, the serve's ``TF_GLM53_DSPARK``): after the two chains a
++third, dspark chain runs the drafter itself — tap passes at every chunk size the serve's tap feeding uses (1..64 rows:
++decode rounds chunk at the block, prompt chunks at the drafter's 64-row tap_in), one block pass (``propose``, the
++serve's draft step; the block is always whole — the depth / confidence cut only trims the host chain's candidate list,
++never a launch shape), then verify windows of every width the runner captures (1..block + 1 and the copy widths 8 and
++16) — so every Triton kernel the drafter launches at its real shapes lands in the pack (the static needs enumeration
++cannot see drafter launches; cuda_draft.zig's ``enumerate`` is this chain's mirror). Tap values are zeros: the pack
++needs shapes, not bits (and only the first ``--layers`` layers are loaded, so the later tap columns would be zero
++anyway). Without the env the capture is unchanged.
++
+ Must run inside the GLM-5.3 TP4 image (torch, Triton 3.7, the EXL3 extensions build on first use) with
+ PYTHONPATH at the champion source's ``src`` and TRITON_CACHE_DIR set to a fresh directory (for ``--record``).
+ Usage: see tools/glm53/README.md.
+@@ -71,6 +81,10 @@
+ TRITON_KERNELS = ("_rmsnorm", "_router_part", "_router_sum", "_topk", "_residual_add", "_kv_write", "_ik_write",
+                   "_iq_rope", "_index_scores", "_select_keys", "_absorb", "_attn_chunks", "_merge", "_expand",
+                   "_swiglu2")
++# the DSpark drafter's own Triton kernels (dspark.py / dflash2.py / glm5_next glue), checked only when the dspark
++# chain ran (TF_GLM53_DSPARK): the drafter's _rmsnorm / _residual_add share the target kernel names
++DSPARK_KERNELS = ("_group_sums", "_prep_kernel", "_block_attn_kernel", "_embed_b16", "_swiglu")
++DSPARK_TAP_ROWS = 64            # SparkDrafter.tap_in rows (the widest tap chunk the serve's add_taps feeds)
+ 
+ 
+ def freeze_env() -> dict:
+@@ -276,6 +290,7 @@
+     if not (a.record or a.fixtures):
+         ap.error("nothing to do: --record and/or --fixtures")
+     env = freeze_env()
++    spath = os.environ.get("TF_GLM53_DSPARK", "")   # the DSpark drafter: its chain records its Triton launches
+     tree = Path(a.tools) if a.tools else Path(__file__).resolve().parents[2]
+     out = Path(a.out)
+     out.mkdir(parents=True, exist_ok=True)
+@@ -405,6 +420,56 @@
+             meta["chains"]["long"] = {"file": "long.safetensors", "capacity": cap, "prefix": P, "buffer_rows": 4,
+                                       "score_cols": 32768, "seed": LONG_SEED, "windows": rows}
+             del radix
++
++        # -- dspark chain (TF_GLM53_DSPARK: the drafter's own launches — what the Zig serve's AOT pack lacks) ----
++        # The serve's draft step is runner.py's _generate_dflash (self.spark): every round's kept rows go to the
++        # drafter's context (runner._add_taps -> add_taps: decode chunks of at most the block, prompt chunks of at
++        # most tap_in's 64 rows), then dr.propose(pending, room, sampling, conf, policy=...) runs one block pass and
++        # the target verifies [pending, drafts] in one window (runner._verify, the widths runner.widths captures:
++        # 1..block + 1, plus the copy widths 8 and 16). This chain runs the same pieces at every shape the serve can
++        # (cuda_draft.zig's enumerate, the Zig mirror: tap passes of 1..tap_rows rows and the block pass).
++        if spath:
++            from tensorfold.families.glm_moe_dsa.cuda import dspark, dspark_host, headq
++
++            with phase("dspark-load"):
++                scfg = dspark_host.DSparkConfig.read(spath)
++                dspark_host.check(scfg, a.world, hidden=cfg.hidden_size, vocab=cfg.vocab_size,
++                                  layers=cfg.num_hidden_layers)
++                w.tap_slot, (_, scols) = dspark_host.tap_plan([None, scfg.tap_layers])
++                sset, squant = dspark_host.settings(scfg.block), dspark_host.quant()
++                headq.prepare(w, drafts=True)     # the serve's q4 draft head (k = 0: the full share; native qmm, so
++                sd = dspark.SparkDrafter(         # the placeholder head's shape sets no Triton variant)
++                    spath, w, capacity=sum(range(1, DSPARK_TAP_ROWS + 1)), settings=sset, quant=squant, tap_cols=scols)
++            zeros = torch.zeros((sd.tap_in.shape[0], len(sd.tap_layers) * sd.D), dtype=torch.bfloat16,
++                                device=w.device)
++            with phase("dspark-taps", detail=True):
++                for n in range(1, sd.tap_in.shape[0] + 1):
++                    sd.add_taps(zeros[:n])        # the context grows 1 + 2 + ... + 64 = 2080 positions, monotonically
++            with phase("dspark-block", detail=True):
++                drafts = sd.propose(int(toks[0]), sd.block, None, float(sset["confidence"]), policy=sset["policy"])
++            rows = []
++            if long:
++                # verify windows of every width the runner captures, at the long chain's end (positions past
++                # index_topk, the 32768 key bucket, decode buffers of the serve's widest width) — the copy width
++                # 16 first so all 61 rows fit the state's P + 64 capacity.
++                vw = fused.Buffers(w, max(16, sd.block + 1), 32768, decode=True)
++                dtoks = tokens(a.long + 64, 7)
++                q = a.long
++                for R in (16, *range(1, sd.block + 2)):
++                    T = fused.bucket(q + R, topk)
++                    with phase(f"dspark-verify{R}", detail=True):
++                        run_window(w, st, vw, dtoks, q, q + R, T)
++                    rows.append({"name": f"verify{R}", "a": q, "e": q + R, "T": T or 0})
++                    q += R
++            meta["chains"]["dspark"] = {
++                "draft_dir": spath, "block": scfg.block, "layers": scfg.layers, "tap_layers": list(scfg.tap_layers),
++                "quant": squant, "settings": {k: sset[k] for k in ("depth", "policy", "confidence", "top_k")},
++                "tap_pass_sizes": f"1..{sd.tap_in.shape[0]} (zeros: the pack needs shapes, not bits)",
++                "drafts": len(drafts), "windows": rows,
++            }
++            print(f"[oracle] dspark chain: block {scfg.block}, {len(sd.tap_layers)} tap layers, quant {squant}; "
++                  f"{sd.tap_in.shape[0]} tap pass sizes; block pass -> {len(drafts)} drafts (policy "
++                  f"{sset['policy']}); {len(rows)} verify windows", flush=True)
+         torch.cuda.synchronize()
+ 
+     if a.fixtures:
+@@ -423,7 +488,7 @@
+     if rec is not None:
+         rec.dump(out / "launches.json")
+         (out / "jit.json").write_text(json.dumps(specialization(), indent=1, sort_keys=True) + "\n")
+-        pack(tree, out, Path(os.environ["TRITON_CACHE_DIR"]))
++        pack(tree, out, Path(os.environ["TRITON_CACHE_DIR"]), dspark=bool(spath))
+     print("[oracle] done", flush=True)
+     return 0
+ 
+@@ -444,7 +509,7 @@
+     return out
+ 
+ 
+-def pack(tree: Path, out: Path, cache: Path) -> None:
++def pack(tree: Path, out: Path, cache: Path, dspark: bool = False) -> None:
+     """manifest.json (each launched specialization's cubin and ABI), then aot.json + cubins/ in OUT/aot."""
+     py = sys.executable
+     subprocess.run([py, "-B", str(tree / "tools" / "zig" / "triton_aot_manifest.py"), "--cache", str(cache),
+@@ -455,6 +520,8 @@
+     aot = json.loads((out / "aot" / "aot.json").read_text())
+     have = {k["fn"] for k in aot["kernels"]}
+     missing = [k for k in TRITON_KERNELS if k not in have]
++    if dspark:                                # the dspark chain ran: its own kernels must be in the pack
++        missing += [k for k in DSPARK_KERNELS if k not in have]
+     lines = [f"{k['fn']:16s} warps {k['num_warps']} stages {k.get('num_stages', 0)} hash {k['hash'][:12]} "
+              f"params {[p['name'] for p in k['params']]} consts "
+              f"{ {n: (c.get('int', c.get('f32', 'none'))) for n, c in k['consts'].items()} }" for k in aot["kernels"]]

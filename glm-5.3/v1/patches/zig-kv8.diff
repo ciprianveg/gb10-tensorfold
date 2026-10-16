@@ -1,0 +1,1425 @@
+diff --git a/tools/glm53/oracle.py b/tools/glm53/oracle.py
+index cd9d1bf9..7e536ba0 100644
+--- a/tools/glm53/oracle.py
++++ b/tools/glm53/oracle.py
+@@ -20,9 +20,19 @@ gate runs:
+ 
+ ``--record``: tools/zig/triton_aot_manifest.py's Recorder logs every Triton specialization and EXL3 extension call;
+ at the end the manifest and aot_pack.py turn the Triton cache into aot.json + cubins/ (the kernel set the Zig engine
+-loads). ``--fixtures``: per window, each layer's output rows, cache rows written, selections and end-of-layer
++loads). ``--fixtures``: per window, each layer's output rows, cache rows, selections and end-of-layer
+ scratch (diagnostics) as safetensors, plus meta.json (frozen env, tiles, versions, weight digests).
+ 
++``TF_GLM53_DSPARK=<dir>`` (the DSpark drafter's checkpoint, the serve's ``TF_GLM53_DSPARK``): after the two chains a
++third, dspark chain runs the drafter itself — tap passes at every chunk size the serve's tap feeding uses (1..64 rows:
++decode rounds chunk at the block, prompt chunks at the drafter's 64-row tap_in), one block pass (``propose``, the
++serve's draft step; the block is always whole — the depth / confidence cut only trims the host chain's candidate list,
++never a launch shape), then verify windows of every width the runner captures (1..block + 1 and the copy widths 8 and
++16) — so every Triton kernel the drafter launches at its real shapes lands in the pack (the static needs enumeration
++cannot see drafter launches; cuda_draft.zig's ``enumerate`` is this chain's mirror). Tap values are zeros: the pack
++needs shapes, not bits (and only the first ``--layers`` layers are loaded, so the later tap columns would be zero
++anyway). Without the env the capture is unchanged.
++
+ Must run inside the GLM-5.3 TP4 image (torch, Triton 3.7, the EXL3 extensions build on first use) with
+ PYTHONPATH at the champion source's ``src`` and TRITON_CACHE_DIR set to a fresh directory (for ``--record``).
+ Usage: see tools/glm53/README.md.
+@@ -71,6 +81,10 @@ DIAG = ("normed", "qa", "qn", "kva", "q", "qlat", "qrot", "ol", "o", "ik", "iw",
+ TRITON_KERNELS = ("_rmsnorm", "_router_part", "_router_sum", "_topk", "_residual_add", "_kv_write", "_ik_write",
+                   "_iq_rope", "_index_scores", "_select_keys", "_absorb", "_attn_chunks", "_merge", "_expand",
+                   "_swiglu2")
++# the DSpark drafter's own Triton kernels (dspark.py / dflash2.py / glm5_next glue), checked only when the dspark
++# chain ran (TF_GLM53_DSPARK): the drafter's _rmsnorm / _residual_add share the target kernel names
++DSPARK_KERNELS = ("_group_sums", "_prep_kernel", "_block_attn_kernel", "_embed_b16", "_swiglu")
++DSPARK_TAP_ROWS = 64            # SparkDrafter.tap_in rows (the widest tap chunk the serve's add_taps feeds)
+ 
+ 
+ def freeze_env() -> dict:
+@@ -276,6 +290,7 @@ def main() -> int:
+     if not (a.record or a.fixtures):
+         ap.error("nothing to do: --record and/or --fixtures")
+     env = freeze_env()
++    spath = os.environ.get("TF_GLM53_DSPARK", "")   # the DSpark drafter: its chain records its Triton launches
+     tree = Path(a.tools) if a.tools else Path(__file__).resolve().parents[2]
+     out = Path(a.out)
+     out.mkdir(parents=True, exist_ok=True)
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 23bda19c..55581b8d 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -64,6 +64,9 @@ const kernels = [_]Kernel{
+     // Phase 4: the drafters' torch steps (rotary, the ring, the rank-order sums, small dots) and strided row copies
+     // (the target's tap rows): torch's default nvcc flags (cosf / sinf as torch's, no fast math)
+     .{ .name = "glm53_draft", .flags = &.{"-O3"} },
++    // 8-bit KV cache (TF_GLM53_KV8): the latent plane's e4m3 quantize (staged writes) and the dequantize the
++    // unchanged Triton attention kernels' bf16 scratch rows come from
++    .{ .name = "glm53_kv8", .flags = &.{"-O3"} },
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+@@ -163,6 +166,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     glm_tool.addImport("glm53", mods.glm53);
+     const glm_exe = b.addExecutable(.{ .name = "tf-glm53-layers", .root_module = glm_tool });
+     b.step("tf-glm53-layers", "GLM-5.3's first N layers against the Python oracle's fixtures (CUDA)").dependOn(&b.addInstallArtifact(glm_exe, .{}).step);
++    // kv8repro: the kv8 write/read chain against the bf16 path it wraps, self-consistent, no model (KV8 campaign)
++    const kv8_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/kv8repro.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
++    kv8_tool.addImport("cuda", cuda);
++    kv8_tool.addImport("glm53", mods.glm53);
++    const kv8_exe = b.addExecutable(.{ .name = "kv8repro", .root_module = kv8_tool });
++    b.step("kv8repro", "The kv8 chain vs the bf16 path it wraps, self-consistent (CUDA)").dependOn(&b.addInstallArtifact(kv8_exe, .{}).step);
+     // tf-glm53-generate: full GLM-5.3 at TP over NCCL, greedy, one process a rank (Phase 2a)
+     const gen_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
+     gen_tool.addImport("cuda", cuda);
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 48b907fe..1646ab90 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -52,6 +52,7 @@ pub const glm53_prompt_experts: []const u8 = if (available) &Blob("fatbin_glm53_
+ pub const glm53_decode: []const u8 = if (available) &Blob("fatbin_glm53_decode").bytes else &.{};
+ pub const glm53_mtp: []const u8 = if (available) &Blob("fatbin_glm53_mtp").bytes else &.{};
+ pub const glm53_draft: []const u8 = if (available) &Blob("fatbin_glm53_draft").bytes else &.{};
++pub const glm53_kv8: []const u8 = if (available) &Blob("fatbin_glm53_kv8").bytes else &.{};
+ 
+ /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
+ pub const gdn_symbols = struct {
+diff --git a/zig/src/families/glm_moe_dsa/cuda_dcp.zig b/zig/src/families/glm_moe_dsa/cuda_dcp.zig
+index 1cfd1368..f4e09f19 100644
+--- a/zig/src/families/glm_moe_dsa/cuda_dcp.zig
++++ b/zig/src/families/glm_moe_dsa/cuda_dcp.zig
+@@ -495,6 +495,21 @@ test "cache bytes a rank: N streams with the cache split take what the one-strea
+     try std.testing.expectApproxEqAbs(@as(f64, 50.4), @as(f64, @floatFromInt(rankCacheBytes(tb, 140_000, 2, 4, 1))) / gib, 0.1);
+ }
+ 
++test "TF_GLM53_KV8's cache bytes: e4m3 latent + 2 fp32 scales a row, index keys bf16 (findings-kv8.md §2.1)" {
++    // the latent row: 576 e4m3 codes + two fp32 scales = 584 bytes (bf16: 1152); tokenBytes takes the row's
++    // elements (it doubles them), so kv8's 584-byte row is 292 "elements"
++    const tb8 = tokenBytes(78, 21, 292, 128, true, true);
++    try std.testing.expectEqual(@as(usize, 51_768), tb8); // 79 x 584 + 22 x 256
++    const tb16 = tokenBytes(78, 21, 576, 128, true, true);
++    // 50.6 KiB a token: 53.55% of bf16's 94.4 - the DCP 1 ceiling roughly x1.87
++    try std.testing.expectApproxEqAbs(@as(f64, 50.55), @as(f64, @floatFromInt(tb8)) / 1024.0, 0.01);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.5355), @as(f64, @floatFromInt(tb8)) / @as(f64, @floatFromInt(tb16)), 0.001);
++    // the 32K x 8 serve's 2.95 GiB a stream drops to ~1.59
++    const gib: f64 = 1 << 30;
++    try std.testing.expectApproxEqAbs(@as(f64, 2.95), @as(f64, @floatFromInt(rankCacheBytes(tb16, 32_768, 2, 1, 1))) / gib, 0.01);
++    try std.testing.expectApproxEqAbs(@as(f64, 1.58), @as(f64, @floatFromInt(rankCacheBytes(tb8, 32_768, 2, 1, 1))) / gib, 0.01);
++}
++
+ test "the boot check of several streams under DCP: a whole reserve, the token cap, a fitting context in the refusal" {
+     const gib: u64 = 1 << 30;
+     try std.testing.expect(streamsTokensOk(500_000, 2));
+diff --git a/zig/src/families/glm_moe_dsa/cuda_engine.zig b/zig/src/families/glm_moe_dsa/cuda_engine.zig
+index 783ba4d3..04f2fdfd 100644
+--- a/zig/src/families/glm_moe_dsa/cuda_engine.zig
++++ b/zig/src/families/glm_moe_dsa/cuda_engine.zig
+@@ -158,6 +158,10 @@ pub const Options = struct {
+     /// TF_GLM53_PRECAPTURE)
+     parallel: usize = 1,
+     multi_set: multi.Settings = .{},
++    /// TF_GLM53_KV8: the latent KV cache in e4m3 + two fp32 scales a row (584 B vs 1152 bf16; DCP 1 only for now).
++    /// Lossy - bits differ from the bf16 cache (the VERIFY_HEAD=fp8 gating style); per-mode determinism holds within
++    /// one setting. Halves the dominant cache term: ~94.4 -> ~50.6 KiB a token (findings-kv8.md).
++    kv8: bool = false,
+ 
+     /// The server's settings: TF_GLM53_RANK / _WORLD / _MASTER / _AOT / ... (the script's names), `context` from
+     /// --context. Unset variables keep tf-glm53-generate --mode 3a's defaults (the image's served ones).
+@@ -224,6 +228,7 @@ pub const Options = struct {
+             std.log.err("TF_GLM53_DRAFT_CUT (a number), _STREAMS / TF_GLM53_QUICK_ROWS (whole numbers)", .{});
+             return error.BadSetting;
+         };
++        o.kv8 = try envFlag("TF_GLM53_KV8", false);
+         if (o.aot.len == 0) {
+             std.log.err("glm53: no Triton kernel pack: set TF_GLM53_AOT to the directory with aot.json", .{});
+             return error.NoKernelPack;
+@@ -272,9 +277,11 @@ fn settingsDigest(o: Options, dcp: usize, drafts: u64) u64 {
+     const cw = [_]usize{ @intFromBool(o.copy.on), o.copy.match, o.copy.most, o.verify_rows, o.parallel };
+     h.update(std.mem.asBytes(&cw));
+     if (o.parallel > 1) o.multi_set.digest(&h);
+-    const shape = [_]usize{ o.world, o.context, o.k, o.draft_vocab, o.mtp_reuse, @intFromBool(o.graphs), @intFromBool(o.prewarm), @intFromBool(o.roce), o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.multi_select), @intFromBool(o.device_cands), @intFromBool(o.mtp_dense), dcp, @intFromBool(o.roce_health), @intFromBool(o.reuse.on), o.reuse.gap, o.reuse.stride, o.reuse.entries, @intFromBool(o.reuse.loose), @intFromFloat(o.l2pf_mb * 1024) };
++    const shape = [_]usize{ o.world, o.context, o.k, o.draft_vocab, o.mtp_reuse, @intFromBool(o.graphs), @intFromBool(o.prewarm), @intFromBool(o.roce), o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.multi_select), @intFromBool(o.device_cands), @intFromBool(o.mtp_dense), dcp, @intFromBool(o.roce_health), @intFromBool(o.reuse.on), o.reuse.gap, o.reuse.stride, o.reuse.entries, @intFromBool(o.reuse.loose), @intFromFloat(o.l2pf_mb * 1024), @intFromBool(o.kv8) };
+     h.update(std.mem.asBytes(&shape));
+-    for ([_][]const u8{ o.experts, o.pe_det, o.side, o.l2pf }) |t| {
++    // TF_GLM53_KV8 normalizes the side letters to off, so the raw TF_GLM53_SIDE no longer changes behavior: hash
++    // it empty then (kv8 itself is in `shape`), or ranks that differ only in the ignored setting would refuse.
++    for ([_][]const u8{ o.experts, o.pe_det, if (o.kv8) "" else o.side, o.l2pf }) |t| {
+         h.update(t);
+         h.update("|");
+     }
+@@ -317,6 +324,7 @@ pub const Boot = struct {
+     side: ?dec.Side = null,
+     l2pf: ?dec.L2pf = null,
+     sp: ?prompt.Sp = null,
++    kv8: ?fw.Kv8 = null, // TF_GLM53_KV8's staging / scratch / ramp tables (one serves every layer)
+     fwd: fw.Forward, // the sequence-parallel chunk points at it (Sp.main); the Runner holds a copy
+     r: rn.Runner,
+     // Phase 4: the drafters' configs (read and checked before anything loads), their tap plan, the drafters, the
+@@ -351,6 +359,7 @@ pub const Boot = struct {
+         b.side = null;
+         b.l2pf = null;
+         b.sp = null;
++        b.kv8 = null;
+         b.dspark_cfg = null;
+         b.dflash_cfg = null;
+         b.dspark_set = .{ .depth = 0 };
+@@ -420,7 +429,7 @@ pub const Boot = struct {
+         }
+         b.plan = try dhost.TapPlan.make(want);
+         try checkParallelDrafters(o.parallel, if (b.dflash_cfg) |c| c.block else null, if (b.dspark_cfg) |c| c.block else null);
+-        const mode_word: u64 = @intFromEnum(b.mode);
++        const mode_word: u64 = @backingInt(b.mode);
+         dh.update(std.mem.asBytes(&mode_word));
+         // a quantized head's bytes and the kv_b setting join the record only when on: off, the digest is unchanged
+         const head_id = try headq.identityOf(gpa, io, o.head_q, o.model, b.cfg.vocab, b.cfg.hidden);
+@@ -496,21 +505,48 @@ pub const Boot = struct {
+                 b.mtp_dense = x;
+             } else |e| std.log.warn("glm53 rank {d}: MTP prompt rows dense unavailable ({t})", .{ o.rank, e });
+         }
+-        const letters = try dec.parseSide(o.side);
++        // TF_GLM53_SIDE's letters default ON ("af"); TF_GLM53_KV8 turns the side stream off instead of refusing
++        // the boot (findings-kv8.md §9): the letters are decode-window overlap only - the same kernels with the
++        // same bits on a second stream - so off costs speed, never quality, and an operator should not need to
++        // know the default to boot the opt-in cache mode. The staged kv8 path is simply not VERIFIED against the
++        // side fork yet (§9.3); flip this off (and drop the digest normalization below) to run that gate.
++        var letters = try dec.parseSide(o.side);
++        var kv8_side_off = false;
++        if (o.kv8 and letters.any()) {
++            kv8_side_off = true;
++            letters = .{ .a = false, .w = false, .f = false };
++        }
+         if (letters.any()) b.side = try dec.Side.init(&b.driver, letters);
+         const pf_mode = try l2pfMode(o.l2pf);
+         if (pf_mode >= 0) {
+             if (!(o.l2pf_mb > 0 and o.l2pf_mb <= 64)) return error.BadL2pfBudget;
+             b.l2pf = try dec.L2pf.init(gpa, &b.driver, &b.w, .{ .mode = pf_mode, .mb = o.l2pf_mb, .after = o.l2pf_after });
+         }
+-        b.fwd = .{ .w = &b.w, .k = &b.k, .s = b.stream, .inv = b.inv.ptr, .comm = &b.comm, .fast = b.fast, .ring = true, .wide = &b.main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (b.side) |*x| x else null, .l2pf = if (b.l2pf) |*x| x else null, .multi_select = o.multi_select, .prof = null, .mtp_dense = if (b.mtp_dense) |*x| x else null, .dcp = b.dcp, .taps = try fw.Taps.of(&b.plan) };
+-        if (o.prompt_sp and o.world > 1 and b.dcp == 1) b.sp = try prompt.Sp.init(&b.driver, &b.fwd, b.side_stream, &b.side_wide);
+-        b.stage = 17;
++        // TF_GLM53_KV8: the staged quantize / dequantize side buffers. v1 limits: DCP 1 (the _attn_dcp read path is
++        // not staged yet; vLLM's fp8 MLA carries the same constraint on its DCP path), no sequence-parallel prompt
++        // chunks (frontAttn writes the caches on the side stream). The side stream is auto-off above.
+         const capacity = o.context + o.k + 1; // Glm53Engine: Runner(limit + k + 1)
++        if (o.kv8) {
++            if (b.dcp > 1) {
++                std.log.err("TF_GLM53_KV8 needs decode context parallelism off for now (DCP 1): unset TF_GLM53_DCP / stay under {d} tokens of context", .{dcpm.dcp_auto_tokens});
++                return error.Kv8NeedsDcp1;
++            }
++            if (kv8_side_off) std.log.info("glm53 rank {d}: side stream off (kv8): TF_GLM53_SIDE '{s}' ignored - its overlap is scheduling only (no quality change); the staged kv8 path is not verified against the side fork (findings-kv8.md §9.3)", .{ o.rank, o.side });
++            if (o.prompt_sp and o.world > 1) std.log.warn("glm53 rank {d}: TF_GLM53_KV8 turns the sequence-parallel prompt chunk off (its side stream writes the caches)", .{o.rank});
++            const kv = try fw.Kv8.init(gpa, &b.driver, b.cfg, @max(o.prompt_rows, fw.max_rows), fw.max_rows, dcpm.localCapacity(capacity, 1));
++            const rows_cap = dcpm.localCapacity(capacity, 1);
++            const per_tok = fw.State.bytesForDcpKv8(&b.w, capacity, 1, true) / rows_cap;
++            const per_tok16 = fw.State.bytesForDcpKv8(&b.w, capacity, 1, false) / rows_cap;
++            std.log.info("glm53 rank {d}: 8-bit KV on (TF_GLM53_KV8): e4m3 latent + 2 fp32 scales a token, index keys bf16 - {d:.1} KB a token of caches ({d:.0}% of bf16), staging + scratch {d:.0} MiB", .{ o.rank, @as(f64, @floatFromInt(per_tok)) / 1024.0, per_tok * 100 / per_tok16, @as(f64, @floatFromInt(kv.bytes())) / (1 << 20) });
++            b.kv8 = kv;
++        }
++        b.fwd = .{ .w = &b.w, .k = &b.k, .s = b.stream, .inv = b.inv.ptr, .comm = &b.comm, .fast = b.fast, .ring = true, .wide = &b.main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (b.side) |*x| x else null, .l2pf = if (b.l2pf) |*x| x else null, .multi_select = o.multi_select, .prof = null, .mtp_dense = if (b.mtp_dense) |*x| x else null, .dcp = b.dcp, .taps = try fw.Taps.of(&b.plan), .kv8 = if (b.kv8) |*x| x else null };
++        if (o.prompt_sp and o.world > 1 and b.dcp == 1 and !o.kv8) b.sp = try prompt.Sp.init(&b.driver, &b.fwd, b.side_stream, &b.side_wide);
++        b.stage = 17;
+         try b.checkCacheFits(capacity);
+         // --parallel N: N slots of the caches; copy drafts are one stream's (Runner: slots == 1)
+         const copy_set: copies.Settings = if (o.parallel > 1) .{ .on = false, .match = 0, .most = 0 } else o.copy;
+-        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .prompt_sp = o.prompt_sp, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp, .verify_rows = o.verify_rows, .draft_rows = if (b.dspark_cfg) |c| c.block + 1 else 0, .copy = copy_set, .slots = o.parallel });
++        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .prompt_sp = o.prompt_sp and !o.kv8, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp, .verify_rows = o.verify_rows, .draft_rows = if (b.dspark_cfg) |c| c.block + 1 else 0, .copy = copy_set, .slots = o.parallel, .kv8 = o.kv8 });
+         b.stage = 18;
+         // Phase 4: the drafters on every rank (each its heads / MLP share), attached to the runner before its prewarm
+         if (b.dflash_cfg != null) {
+@@ -551,8 +587,10 @@ pub const Boot = struct {
+     fn checkCacheFits(b: *Boot, capacity: usize) !void {
+         const mem = try b.ctx.memInfo();
+         const reserve_gb: f64 = if (std.c.getenv("TF_GLM53_CACHE_RESERVE_GB")) |v| (std.fmt.parseFloat(f64, std.mem.span(v)) catch 6) else 6;
+-        const row: u64 = b.cfg.layers * b.cfg.latentWidth() * 2;
++        const row: u64 = b.cfg.layers * fw.State.latentRow(b.o.kv8, b.cfg);
+         const local: u64 = dcpm.localCapacity(capacity, b.dcp);
++        // TF_GLM53_KV8's side buffers (staging, the decode scratch, the prompt mirror) sit beside the caches
++        const extra: u64 = if (b.kv8) |*v| v.bytes() else 0;
+         if (b.o.parallel > 1 and b.dcp > 1) {
+             // several streams under DCP: the whole of what the slots allocate (index keys and the MTP layer too),
+             // against a reserve that is not halved when little is free - a node that runs out here does not fail,
+@@ -562,7 +600,7 @@ pub const Boot = struct {
+             // ran a node down to 4 GB with 24 GiB left here, so four streams are refused until that is measured smaller.
+             const sgb_default: f64 = dcpm.streams_reserve_gb * @as(f64, @floatFromInt(b.o.parallel)) / 2;
+             const sgb: f64 = if (std.c.getenv("TF_GLM53_DCP_STREAMS_RESERVE_GB")) |v| (std.fmt.parseFloat(f64, std.mem.span(v)) catch sgb_default) else sgb_default;
+-            const per: u64 = fw.State.bytesForDcp(&b.w, capacity, b.dcp);
++            const per: u64 = fw.State.bytesForDcpKv8(&b.w, capacity, b.dcp, b.o.kv8);
+             const sf = dcpm.streamsFit(per, b.o.parallel, mem.free, sgb);
+             const gib_f: f64 = 1 << 30;
+             std.log.info("glm53 rank {d}: {d} streams x {d} tokens, cache split over {d} ranks: {d:.1} GiB of caches here, {d:.1} GiB free, {d:.1} GiB left after them (reserve {d:.1})", .{ b.o.rank, b.o.parallel, capacity, b.dcp, @as(f64, @floatFromInt(sf.need)) / gib_f, @as(f64, @floatFromInt(sf.free)) / gib_f, (@as(f64, @floatFromInt(sf.free)) - @as(f64, @floatFromInt(sf.need))) / gib_f, sgb });
+@@ -572,9 +610,15 @@ pub const Boot = struct {
+             }
+             return;
+         }
+-        const x = cacheFit(row, local, b.o.parallel, b.dcp, 0, mem.free, reserve_gb) orelse return;
++        const x = cacheFit(row, local, b.o.parallel, b.dcp, extra, mem.free, reserve_gb) orelse return;
+         const gib = 1 << 30;
+-        std.log.err("context {d} x {d} streams needs {d:.1} GiB of caches a rank, {d:.1} GiB is free (keeping {d:.0} GiB spare): use --context <= {d} with --parallel {d}, or fewer streams", .{ capacity, b.o.parallel, @as(f64, @floatFromInt(x.need)) / gib, @as(f64, @floatFromInt(x.free)) / gib, @as(f64, @floatFromInt(x.spare)) / gib, x.fit, b.o.parallel });
++        std.log.err("context {d} x {d} streams needs {d:.1} GiB of caches a rank, {d:.1} of {d:.1} GiB is free (keeping {d:.0} GiB spare): use --context <= {d} with --parallel {d}, or fewer streams", .{ capacity, b.o.parallel, @as(f64, @floatFromInt(x.need)) / gib, @as(f64, @floatFromInt(x.free)) / gib, @as(f64, @floatFromInt(mem.total)) / gib, @as(f64, @floatFromInt(x.spare)) / gib, x.fit, b.o.parallel });
++        // the 2026-10-16 anomalies (findings-kv8.md §10): a boot racing a live or not-yet-released previous
++        // serve measures ~40 GiB less free and refuses shapes the node fits clean. A clean node holds ~67-70 GiB
++        // at this check (weights 47.5 + the MTP layer's dense experts 18 + the wide / kv8 side buffers); much
++        // more than that is somebody else's allocation.
++        const held: u64 = mem.total -| mem.free;
++        if (held > 90 * gib) std.log.warn("the device reports {d:.1} GiB held - far past this boot's ~67 GiB of weights and side buffers: another serve's caches (or its page cache) are likely still allocated - check every node (docker ps, nvidia-smi) before rebooting smaller", .{@as(f64, @floatFromInt(held)) / gib});
+         return error.CacheDoesNotFit;
+     }
+ 
+@@ -586,6 +630,7 @@ pub const Boot = struct {
+         if (s >= 18) b.r.deinit();
+         if (s >= 17) if (b.sp) |*x| x.deinit();
+         if (s >= 16) {
++            if (b.kv8) |*x| x.deinit();
+             if (b.l2pf) |*x| x.deinit();
+             if (b.side) |*x| x.deinit();
+             if (b.mtp_dense) |*x| x.deinit();
+@@ -1075,6 +1120,37 @@ test "the cache check refuses a context x streams that leaves less than the rese
+     try std.testing.expectEqual(@as(?CacheFit, null), cacheFit(row, 1000, 1, 1, 0, 4 * gib, 6));
+ }
+ 
++test "TF_GLM53_KV8's cache check: the halved row plus the side buffers' extra (findings-kv8.md §2.4)" {
++    const gib: u64 = 1 << 30;
++    // 78 layers of 584-byte rows (e4m3 + 2 fp32 scales) against bf16's 1152; the side buffers (staging 9 MiB,
++    // the decode scratch 297 MiB, the 32K prompt mirror 36 MiB, tables) ~ 344 MiB at the 32K shape
++    const row8: u64 = 78 * 584;
++    const row16: u64 = 78 * 1152;
++    const extra: u64 = 344 * (1 << 20);
++    // 8 x 32K on 24 GiB free (the live serve's figure): refused in bf16, fits with kv8's row and the extra
++    try std.testing.expect(cacheFit(row16, 32768 + 4, 8, 1, 0, 24 * gib, 6) != null);
++    try std.testing.expectEqual(@as(?CacheFit, null), cacheFit(row8, 32768 + 4, 8, 1, extra, 24 * gib, 6));
++    // one stream on 44 GiB free: bf16 refuses 500K, kv8 fits it - and kv8's own refusal says ~827K, ~1.8x bf16's
++    try std.testing.expect(cacheFit(row16, 500_004, 1, 1, 0, 44 * gib, 6) != null);
++    try std.testing.expectEqual(@as(?CacheFit, null), cacheFit(row8, 500_004, 1, 1, extra, 44 * gib, 6));
++    const bf = cacheFit(row16, 500_004, 1, 1, 0, 44 * gib, 6).?;
++    const kf = cacheFit(row8, 900_004, 1, 1, extra, 44 * gib, 6).?;
++    try std.testing.expect(bf.fit < 500_000 and bf.fit > 400_000); // ~454K
++    try std.testing.expect(kf.fit > 800_000); // ~827K: the doubled DCP 1 ceiling
++}
++
++test "TF_GLM53_KV8 auto-offs the side stream: the ignored TF_GLM53_SIDE leaves the rendezvous digest alone (§9)" {
++    // kv8 on: the side letters are normalized to off, so two ranks that differ only in TF_GLM53_SIDE agree
++    const a = settingsDigest(.{ .model = "m", .context = 32768, .kv8 = true, .side = "af" }, 1, 2);
++    const b = settingsDigest(.{ .model = "m", .context = 32768, .kv8 = true, .side = "0" }, 1, 2);
++    try std.testing.expectEqual(a, b);
++    // kv8 off: the setting matters again, and kv8 itself is in the digest
++    const c = settingsDigest(.{ .model = "m", .context = 32768, .kv8 = false, .side = "af" }, 1, 2);
++    const d = settingsDigest(.{ .model = "m", .context = 32768, .kv8 = false, .side = "0" }, 1, 2);
++    try std.testing.expect(c != d);
++    try std.testing.expect(a != c);
++}
++
+ test "--parallel refusals: DCP, a window wider than a decode window; the drafters draft concurrent streams" {
+     try checkParallel(.{ .parallel = 1, .dspark = "/x" }, 4);
+     try checkParallel(.{ .parallel = 4, .k = 2 }, 1);
+diff --git a/zig/src/families/glm_moe_dsa/cuda_forward.zig b/zig/src/families/glm_moe_dsa/cuda_forward.zig
+index 432122c2..8b144fcd 100644
+--- a/zig/src/families/glm_moe_dsa/cuda_forward.zig
++++ b/zig/src/families/glm_moe_dsa/cuda_forward.zig
+@@ -458,13 +458,17 @@ pub const Buffers = struct {
+ /// fused.State: a 576-wide latent row a token and layer, bf16 index keys on full-indexer layers, the device position.
+ /// DCP (Phase 3b): position p on rank p % dcp at local row p // dcp; every cache holds `local` = ceil(capacity / dcp)
+ /// + 1 rows (capacity + 1 at DCP 1).
++/// TF_GLM53_KV8: the latent rows (kc / mkc) are e4m3 codes + two fp32 scales instead - `lat_row` 584 bytes, 50.8% of
++/// bf16; the index keys stay bf16 (the DSA top-k scoring reads all of them every step: quantized scores would move
++/// the selected set, not just the values). The latent planes' readers go through the staged quantize / dequantize of
++/// cuda_kernels' kv8 pair (Kv8 below); nothing that copies or saves whole rows changes (one plane a layer still).
+ pub const State = struct {
+     d: *const cuda.Driver,
+     gpa: std.mem.Allocator,
+     capacity: usize,
+     dcp: usize = 1,
+     local: usize = 0,
+-    kc: []u64, // per layer: bf16 [local, latent]
++    kc: []u64, // per layer: bf16 [local, latent] - kv8: e4m3 codes + 2 fp32 scales a row (latentRow bytes)
+     ic: []u64, // per layer: bf16 [local, index_dim], 0 on layers without an indexer
+     pos: u64, // int32 [1]
+     mkc: u64 = 0, // the MTP layer's latent rows (0: no MTP layer)
+@@ -476,6 +480,14 @@ pub const State = struct {
+     /// owns only its kc / ic arrays (`view` true: `freeView`, never `deinit`).
+     slots: usize = 1,
+     view: bool = false,
++    /// TF_GLM53_KV8: one latent row's bytes (584: 576 e4m3 + 2 fp32 scales; bf16: 1152).
++    kv8: bool = false,
++    lat_row: usize = 0,
++
++    /// One latent row's bytes: kv8's e4m3 + scales, else bf16.
++    pub fn latentRow(kv8: bool, c: anytype) usize {
++        return if (kv8) c.latentWidth() + 8 else c.latentWidth() * 2;
++    }
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize) !State {
+         return initDcp(gpa, d, w, capacity, 1);
+@@ -490,20 +502,27 @@ pub const State = struct {
+     /// the caches sharded (slots > 1, dcp > 1) are this port's own (docs/glm53-dcp-streams.md): each stream's shard of
+     /// this rank back to back, stream s's position p at row s * local + p / dcp on rank p % dcp.
+     pub fn initSlots(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize, dcp: usize, slots: usize) !State {
++        return initSlotsKv8(gpa, d, w, capacity, dcp, slots, false);
++    }
++
++    /// initSlots with TF_GLM53_KV8's latent rows (the Runner's settings carry the flag; DCP 1 only for now).
++    pub fn initSlotsKv8(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize, dcp: usize, slots: usize, kv8: bool) !State {
+         const c = w.config;
+         if (dcp == 0 or (dcp > 1 and dcp != w.world)) return error.Invalid;
+         if (slots == 0) return error.Invalid;
++        if (kv8 and dcp > 1) return error.Invalid; // the DCP attention read path is not staged yet
+         const rows = dcpm.localCapacity(capacity, dcp);
+         const all = rows * slots;
+-        var s: State = .{ .d = d, .gpa = gpa, .capacity = capacity, .dcp = dcp, .local = rows, .slots = slots, .kc = try gpa.alloc(u64, w.layers.len), .ic = try gpa.alloc(u64, w.layers.len), .pos = 0 };
++        const lat = latentRow(kv8, c);
++        var s: State = .{ .d = d, .gpa = gpa, .capacity = capacity, .dcp = dcp, .local = rows, .slots = slots, .kv8 = kv8, .lat_row = lat, .kc = try gpa.alloc(u64, w.layers.len), .ic = try gpa.alloc(u64, w.layers.len), .pos = 0 };
+         errdefer s.deinit();
+         for (w.layers, 0..) |*L, i| {
+-            s.kc[i] = try s.zeros(all * c.latentWidth() * 2);
++            s.kc[i] = try s.zeros(all * lat);
+             s.ic[i] = if (L.indexer != null) try s.zeros(all * c.index_dim * 2) else 0;
+         }
+         s.pos = try s.zeros(4);
+         if (w.mtp) |*m| {
+-            s.mkc = try s.zeros(all * c.latentWidth() * 2);
++            s.mkc = try s.zeros(all * lat);
+             s.mic = if (m.layer.indexer != null) try s.zeros(all * c.index_dim * 2) else 0;
+             s.mpos = try s.zeros(4);
+         }
+@@ -515,7 +534,7 @@ pub const State = struct {
+     pub fn slotView(s: *const State, w: *const W.Weights, slot: usize) !State {
+         if (slot >= s.slots) return error.Invalid;
+         const c = w.config;
+-        const lat = s.local * c.latentWidth() * 2;
++        const lat = s.local * s.lat_row;
+         const idx = s.local * c.index_dim * 2;
+         var v = s.*;
+         v.view = true;
+@@ -543,19 +562,35 @@ pub const State = struct {
+         return bytesForDcp(w, capacity, 1);
+     }
+ 
++    /// bytes_for with TF_GLM53_KV8's latent rows.
++    pub fn bytesForKv8(w: *const W.Weights, capacity: usize, kv8: bool) usize {
++        return bytesForDcpKv8(w, capacity, 1, kv8);
++    }
++
+     /// Runner._check_cache_fits' figure: the target layers' bf16 latent rows (index keys and the MTP layer not
+     /// counted, as Python counts) of `slots` streams of `capacity` tokens on this rank.
+     pub fn latentBytes(w: *const W.Weights, capacity: usize, dcp: usize, slots: usize) usize {
++        return latentBytesKv8(w, capacity, dcp, slots, false);
++    }
++
++    /// latentBytes with the latent row TF_GLM53_KV8 holds (584 bytes: 576 e4m3 + 2 fp32 scales).
++    pub fn latentBytesKv8(w: *const W.Weights, capacity: usize, dcp: usize, slots: usize, kv8: bool) usize {
+         const c = w.config;
+-        return w.layers.len * c.latentWidth() * 2 * dcpm.localCapacity(capacity, @max(dcp, 1)) * slots;
++        return w.layers.len * latentRow(kv8, c) * dcpm.localCapacity(capacity, @max(dcp, 1)) * slots;
+     }
+ 
+     /// fused.State.bytes_for with w.dcp: a rank's shard of the caches.
+     pub fn bytesForDcp(w: *const W.Weights, capacity: usize, dcp: usize) usize {
++        return bytesForDcpKv8(w, capacity, dcp, false);
++    }
++
++    /// bytes_for with TF_GLM53_KV8's latent rows: a rank's shard of the caches.
++    pub fn bytesForDcpKv8(w: *const W.Weights, capacity: usize, dcp: usize, kv8: bool) usize {
+         const c = w.config;
++        const lat = latentRow(kv8, c);
+         var per: usize = 0;
+-        for (w.layers) |*L| per += c.latentWidth() * 2 + (if (L.indexer != null) c.index_dim * 2 else 0);
+-        if (w.mtp) |*m| per += c.latentWidth() * 2 + (if (m.layer.indexer != null) c.index_dim * 2 else 0);
++        for (w.layers) |*L| per += lat + (if (L.indexer != null) c.index_dim * 2 else 0);
++        if (w.mtp) |*m| per += lat + (if (m.layer.indexer != null) c.index_dim * 2 else 0);
+         return per * dcpm.localCapacity(capacity, @max(dcp, 1));
+     }
+ 
+@@ -592,6 +627,131 @@ pub const State = struct {
+     }
+ };
+ 
++/// TF_GLM53_KV8's side buffers (findings-kv8.md §2.3 + §11): the staging rows the unchanged `_kv_write` fills
++/// through glm53_kv8_stage's tables (the rope rotated at the row's TRUE position - the angle fix; the write row
++/// is staging row r), the bf16 scratch rows the unchanged attention
++/// kernels read (per-row blocks of K rows: a row's keys at r*K + i, the one-stream prefix at [0, K)), the
++/// capacity-sized prompt scratch (a direct mirror of the plane's rows), and the static ramp tables that point the
++/// Triton kernels at the scratch layouts. One serves every layer (the MTP layer's plane too); the decode windows'
++/// launches are graph-capturable (every decision is a device load).
++pub const Kv8 = struct {
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    lw: usize, // the latent half (512)
++    w: usize, // a latent row's values (576)
++    k_sel: usize, // index_topk: keys a row attends (the block width)
++    stage: u64 = 0, // bf16 [stage_rows, w]: the window's written rows, 0..R-1
++    stage_rows: usize = 0,
++    zero_pos: u64 = 0, // int32 [stage_rows] zeros: the dequant's unused BASE / TOK args
++    stage_pos: u64 = 0, // int32 [stage_rows]: THE ROPE FIX - the staging write's TRUE position table P'[r]
++    stage_base: u64 = 0, // int32 [stage_rows]: the staging write's base table B'[r] = r - P'[r] (row r at staging row r)
++    scratch: u64 = 0, // bf16 [rows_max * k_sel, w]: the decode windows' blocks (and one-stream prefix)
++    rows_max: usize = 0,
++    pscratch: u64 = 0, // bf16 [prompt_rows_cap, w]: the prompt chunks' direct mirror of the plane
++    pscratch_rows: usize = 0,
++    ramp_tok: u64 = 0, // int32 [rows_max * k_sel] = r*K + i: one stream's TOK'
++    rows_base: u64 = 0, // int32 [rows_max] = r*K: --parallel's BASE'
++    rows_tok: u64 = 0, // int32 [rows_max * k_sel] = i: --parallel's TOK'
++    mem: std.ArrayList(cuda.DeviceBuffer) = .empty,
++
++    fn alloc(v: *Kv8, n: usize) !u64 {
++        var m = try cuda.DeviceBuffer.alloc(v.d, @max(n, 16));
++        errdefer m.free();
++        try m.fill8(0, null);
++        try v.mem.append(v.gpa, m);
++        return m.ptr;
++    }
++
++    /// `stage_rows`: the widest window that writes (prompt chunks; decode windows are narrower). `rows_max`: the
++    /// widest decode window (its blocks). `prompt_cap`: the local capacity the prompt scratch mirrors.
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, c: anytype, stage_rows: usize, rows_max: usize, prompt_cap: usize) !Kv8 {
++        var v: Kv8 = .{ .gpa = gpa, .d = d, .lw = c.kv_lora, .w = c.latentWidth(), .k_sel = c.index_topk, .stage_rows = stage_rows, .rows_max = rows_max, .pscratch_rows = prompt_cap };
++        errdefer v.deinit();
++        if (c.latentWidth() != c.kv_lora + c.rope or c.latentWidth() % 4 != 0) return error.Invalid;
++        v.stage = try v.alloc(stage_rows * v.w * 2);
++        v.zero_pos = try v.alloc(stage_rows * 4);
++        v.stage_pos = try v.alloc(stage_rows * 4);
++        v.stage_base = try v.alloc(stage_rows * 4);
++        v.scratch = try v.alloc(rows_max * v.k_sel * v.w * 2);
++        v.pscratch = try v.alloc(prompt_cap * v.w * 2);
++        const ramp_words = rows_max * v.k_sel;
++        v.ramp_tok = try v.alloc(ramp_words * 4);
++        v.rows_base = try v.alloc(rows_max * 4);
++        v.rows_tok = try v.alloc(ramp_words * 4);
++        // the static tables (uploaded once; every launch reads them on the device)
++        const zb = try gpa.alloc(u8, stage_rows * 4);
++        defer gpa.free(zb);
++        @memset(zb, 0);
++        try v.upload(v.zero_pos, zb);
++        const rt = try gpa.alloc(i32, ramp_words);
++        defer gpa.free(rt);
++        for (rt, 0..) |*x, i| x.* = @intCast(i);
++        try v.upload(v.ramp_tok, std.mem.sliceAsBytes(rt));
++        const rs = try gpa.alloc(i32, rows_max);
++        defer gpa.free(rs);
++        for (rs, 0..) |*x, i| x.* = @intCast(i * v.k_sel);
++        try v.upload(v.rows_base, std.mem.sliceAsBytes(rs));
++        for (rt, 0..) |*x, i| x.* = @intCast(i % v.k_sel);
++        try v.upload(v.rows_tok, std.mem.sliceAsBytes(rt));
++        return v;
++    }
++
++    fn upload(v: *Kv8, dst: u64, from: []const u8) !void {
++        // a borrowed span over v.mem's memory: upload only copies (free leaves it alone)
++        const m: cuda.DeviceBuffer = .{ .d = v.d, .ptr = dst, .len = from.len, .borrowed = true };
++        try m.upload(0, from);
++    }
++
++    pub fn deinit(v: *Kv8) void {
++        for (v.mem.items) |*m| m.free();
++        v.mem.deinit(v.gpa);
++        v.* = undefined;
++    }
++
++    /// What the side buffers take on the device (the cache guard's `extra`).
++    pub fn bytes(v: *const Kv8) usize {
++        return (v.stage_rows * v.w * 2) + (v.stage_rows * 8) + (v.rows_max * v.k_sel * (v.w * 2 + 4) + v.rows_max * 4) + (v.pscratch_rows * v.w * 2);
++    }
++
++    /// keys()'s write (THE ROPE FIX, §11): `_kv_write` rotates the rope half of its row at the row's TRUE
++    /// position (fused.py: ang_p = pg), so the staging redirect must not zero it. The ROWS variant already
++    /// decouples the two - the angle comes from POS[r] alone, the write row is BASE[r] + POS[r] - so this builds
++    /// P'[r] = the true position and B'[r] = r - P'[r] (glm53_kv8_stage) and runs `_kv_write` ROWS with them:
++    /// staging row r, rope at the true angle, the row bit-identical to the bf16 cache's. Then the quantizer
++    /// takes the true rows. `rows_mode`: several streams (pos a table, `base` their cache bases); else pos is
++    /// the window's first position (a device word), base 0.
++    pub fn stageWrite(v: *Kv8, f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, pos: u64, base: u64, R: usize, rows_mode: bool) !void {
++        if (R > v.stage_rows) return error.WindowTooWide;
++        const rank: usize = if (f.dcp > 1) f.w.rank else 0;
++        try f.ops().kv8Stage(v.stage_pos, v.stage_base, pos, R, rows_mode);
++        try f.t().kvWriteRowsDcp(b.kva, b.kva_n, L.kv_a_norm, v.stage, v.stage_pos, v.stage_base, f.inv, f.w.config.eps, R, f.mla(), f.dcp, rank);
++        try v.quant(f, kc, pos, base, R, rows_mode);
++    }
++
++    /// keys()'s quantize: staging row r -> the plane's row dest_r (the TRUE pos / base tables).
++    pub fn quant(v: *Kv8, f: *const Forward, kc: u64, pos: u64, base: u64, R: usize, rows_mode: bool) !void {
++        if (R > v.stage_rows) return error.WindowTooWide;
++        try f.ops().kv8Quant(v.stage, kc, pos, base, R, rows_mode, v.lw, v.w);
++    }
++
++    /// attentionCore's read (a decode window): the plane's needed rows as bf16 into the block scratch. `pos`: the
++    /// window's positions (a table under --parallel); `base`: the streams' cache bases (0: one stream); `tok`: the
++    /// selection (b.tok). Returns (the scratch, the TOK' and BASE' the Triton launch takes instead).
++    pub fn dequantDecode(v: *Kv8, f: *const Forward, kc: u64, pos: u64, base: u64, tok: u64, R: usize) !struct { lc: u64, tok: u64, base: u64 } {
++        if (R > v.rows_max) return error.WindowTooWide;
++        const mode: c_int = if (base != 0) 2 else 1;
++        try f.ops().kv8Dequant(kc, v.scratch, pos, if (base != 0) base else v.zero_pos, tok, R, v.k_sel, v.lw, v.w, mode, 0);
++        return .{ .lc = v.scratch, .tok = if (base != 0) v.rows_tok else v.ramp_tok, .base = if (base != 0) v.rows_base else 0 };
++    }
++
++    /// attentionCore's read (a prompt / wide window): rows [0, POS[0] + R) as a direct bf16 mirror - the wide
++    /// kernels read keys 0..p (their selections too: every selected row is below the window's end).
++    pub fn dequantPrompt(v: *Kv8, f: *const Forward, kc: u64, pos: u64, R: usize) !u64 {
++        try f.ops().kv8Dequant(kc, v.pscratch, pos, v.zero_pos, v.zero_pos, R, v.k_sel, v.lw, v.w, 0, v.pscratch_rows);
++        return v.pscratch;
++    }
++};
++
+ /// Scoring only (tf-glm53-generate --mode score --score-route): every MoE layer's routed weights and picks of a
+ /// decode-sized window, copied to the host after fused.route. Records: u32 layer, u32 rows, fp32 [rows, top_k]
+ /// weights, i32 [rows, top_k] picks. It synchronizes the stream, so nothing captured or served may hold one.
+@@ -658,6 +818,10 @@ pub const Forward = struct {
+     /// window's first position. Under DCP (dcp > 1) the kernels are the *RowsDcp ones: a row's keys on the owner of its
+     /// position at BASE + POS // dcp, its attention over each rank's share of its own stream's rows.
+     base: u64 = 0,
++    /// TF_GLM53_KV8: the staged quantize / dequantize side buffers (cuda_kernels' kv8 pair); null: bf16 caches.
++    /// The write path fills `Kv8.stage` through the unchanged `_kv_write` and quantizes into the plane; the read path
++    /// dequantizes the needed rows into a bf16 scratch the unchanged attention kernels take as LC. DCP 1 only.
++    kv8: ?*Kv8 = null,
+ 
+     fn ops(f: *const Forward) kern.Ops {
+         return .{ .k = f.k, .s = f.s };
+@@ -861,7 +1025,11 @@ pub const Forward = struct {
+         const c = f.w.config;
+         const t_ = f.t();
+         const rank = f.dcpRank();
+-        if (f.base != 0) {
++        if (f.kv8) |v| {
++            // TF_GLM53_KV8: _kv_write fills the staging rows through kv8_stage's tables (the rope at the TRUE
++            // position - §11), the quantizer takes the true rows
++            try v.stageWrite(f, b, L, kc, pos, f.base, R, f.base != 0);
++        } else if (f.base != 0) {
+             try t_.kvWriteRowsDcp(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.base, f.inv, c.eps, R, f.mla(), f.dcp, rank);
+         } else {
+             try t_.kvWriteDcp(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, f.mla(), f.dcp, rank);
+@@ -906,7 +1074,21 @@ pub const Forward = struct {
+         }
+         const tiling = if (R <= b.small) tri.attn_decode else tri.attn_prompt;
+         if (f.sideOn()) |sd| try sd.join(f.s); // TF_GLM53_SIDE: the window's latents are in the cache
+-        if (f.dcp > 1) {
++        if (f.kv8) |v| {
++            // TF_GLM53_KV8: the unchanged attention kernels read the dequantized bf16 scratch, not the plane. Wide
++            // windows take the direct mirror (their keys are rows 0..p, selections included); decode windows take the
++            // block scratch with the static ramp tables (findings-kv8.md §2.3).
++            if (wide) {
++                const lc = try v.dequantPrompt(f, kc, pos, R);
++                try t_.attention(b.qlat, b.qrot, lc, b.tok, pos, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
++            } else if (f.base != 0) {
++                const s = try v.dequantDecode(f, kc, pos, f.base, b.tok, R);
++                try t_.attentionRows(b.qlat, b.qrot, s.lc, s.tok, pos, s.base, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
++            } else {
++                const s = try v.dequantDecode(f, kc, pos, 0, b.tok, R);
++                try t_.attention(b.qlat, b.qrot, s.lc, s.tok, pos, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
++            }
++        } else if (f.dcp > 1) {
+             try f.attentionDcp(b, kc, pos, R, tiling);
+         } else if (f.base != 0) {
+             try t_.attentionRows(b.qlat, b.qrot, kc, b.tok, pos, f.base, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
+diff --git a/zig/src/families/glm_moe_dsa/cuda_kernels.zig b/zig/src/families/glm_moe_dsa/cuda_kernels.zig
+index edaea43e..10bae403 100644
+--- a/zig/src/families/glm_moe_dsa/cuda_kernels.zig
++++ b/zig/src/families/glm_moe_dsa/cuda_kernels.zig
+@@ -81,6 +81,12 @@ pub const Kernels = struct {
+     // Phase 4c (glm53_draft.cu): the concurrent drafters' per-row positions and pooled-ring scatters
+     draft_rotary_rows: cuda.Function,
+     draft_scatter_rows: cuda.Function,
++    // 8-bit KV cache (TF_GLM53_KV8, glm53_kv8.cu): the staging tables (the rope fix), the latent plane's staged
++    // quantize and the dequantize the unchanged Triton attention kernels' bf16 scratch rows come from
++    kv8_mod: cuda.Module,
++    kv8_stage: cuda.Function,
++    kv8_quant: cuda.Function,
++    kv8_dequant: cuda.Function,
+ 
+     /// Loads both fatbins and resolves every kernel; `triton_dir` holds the captured aot.json and cubins.
+     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, triton_dir: []const u8) !Kernels {
+@@ -143,6 +149,12 @@ pub const Kernels = struct {
+         k.cut_stats = try k.draft_mod.function("glm53_cut_stats");
+         k.draft_rotary_rows = try k.draft_mod.function("glm53_draft_rotary_rows");
+         k.draft_scatter_rows = try k.draft_mod.function("glm53_draft_scatter_rows");
++        // 8-bit KV cache (TF_GLM53_KV8): the staging tables, quantize (staged writes) / dequantize (the attention scratch)
++        k.kv8_mod = try cuda.Module.load(d, cuda.kernels.glm53_kv8);
++        errdefer k.kv8_mod.unload();
++        k.kv8_stage = try k.kv8_mod.function("glm53_kv8_stage");
++        k.kv8_quant = try k.kv8_mod.function("glm53_kv8_quant");
++        k.kv8_dequant = try k.kv8_mod.function("glm53_kv8_dequant");
+         // Phase 3a: the prompt path's own kernels and the device copy of prompt_experts.cu
+         k.prompt_mod = try cuda.Module.load(d, cuda.kernels.glm53_prompt);
+         errdefer k.prompt_mod.unload();
+@@ -182,6 +194,7 @@ pub const Kernels = struct {
+ 
+     pub fn deinit(k: *Kernels) void {
+         k.triton.deinit();
++        k.kv8_mod.unload();
+         k.draft_mod.unload();
+         k.mtp_mod.unload();
+         k.decode_mod.unload();
+@@ -403,7 +416,7 @@ pub const Ops = struct {
+         }
+         var ra: cuda.Args = .{};
+         ra.add(x);
+-        ra.add(@as(c_int, @intFromEnum(x_dtype)));
++        ra.add(@as(c_int, @backingInt(x_dtype)));
+         ra.add(rj);
+         ra.add(int(kk));
+         try cuda.launch.launch(o.k.rot_in, .{ .grid = .{ .x = u((kk / 128 + 3) / 4), .y = u(m), .z = u(lins.len) }, .block = .{ .x = 128 }, .pdl = pdl }, o.s, &ra);
+@@ -425,7 +438,7 @@ pub const Ops = struct {
+                 .y = out,
+                 .z = if (l.sk > 1) sc.z[i] else 0,
+                 .counters = l.counters,
+-                .y_dtype = @intFromEnum(y),
++                .y_dtype = @backingInt(y),
+                 .n = int(l.n),
+                 .sk = int(l.sk),
+                 .start = int(blocks),
+@@ -780,7 +793,7 @@ pub const Ops = struct {
+         rj.xh[0] = xh;
+         var ra: cuda.Args = .{};
+         ra.add(x);
+-        ra.add(@as(c_int, @intFromEnum(x_dtype)));
++        ra.add(@as(c_int, @backingInt(x_dtype)));
+         ra.add(rj);
+         ra.add(int(kk));
+         try cuda.launch.launch(o.k.rot_in, .{ .grid = .{ .x = u((kk / 128 + 3) / 4), .y = u(m), .z = 1 }, .block = .{ .x = 128 } }, o.s, &ra);
+@@ -1110,6 +1123,59 @@ pub const Ops = struct {
+         try cuda.launch.launch(o.k.dcp_merge, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 1024 } }, o.s, &a);
+     }
+ 
++    /// glm53_kv8_stage (THE ROPE FIX, §11): the staging write's position / base tables. P'[r] = the row's true
++    /// position (rows_mode: POS[r]; else POS[0] + r), B'[r] = r - P'[r] - so _kv_write's ROWS variant writes
++    /// staging row B'[r] + P'[r] = r while rotating the rope at the TRUE position (the angle is POS[r] alone).
++    pub fn kv8Stage(o: Ops, spos: u64, sbase: u64, pos: u64, rows: usize, rows_mode: bool) !void {
++        if (rows == 0) return;
++        var a: cuda.Args = .{};
++        a.add(pos);
++        a.add(spos);
++        a.add(sbase);
++        a.add(int(rows));
++        a.add(@as(c_int, @intFromBool(rows_mode)));
++        try cuda.launch.launch(o.k.kv8_stage, .{ .grid = .{ .x = u((rows + 127) / 128) }, .block = .{ .x = 128 } }, o.s, &a);
++    }
++
++    /// glm53_kv8_quant (TF_GLM53_KV8): staging row r (bf16, `w` values) -> the latent plane's row dest_r as e4m3
++    /// codes + two fp32 scales (row stride w + 8 bytes). dest_r as _kv_write would place it: `rows_mode` BASE[r] +
++    /// POS[r], else POS[0] + r. `base` 0 with rows_mode: no base table read.
++    pub fn kv8Quant(o: Ops, stage: u64, plane: u64, pos: u64, base: u64, rows: usize, rows_mode: bool, lw: usize, w: usize) !void {
++        if (rows == 0) return;
++        var a: cuda.Args = .{};
++        a.add(stage);
++        a.add(plane);
++        a.add(pos);
++        a.add(base);
++        a.add(int(rows));
++        a.add(@as(c_int, @intFromBool(rows_mode)));
++        a.add(int(lw));
++        a.add(int(w));
++        try cuda.launch.launch(o.k.kv8_quant, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 128 } }, o.s, &a);
++    }
++
++    /// glm53_kv8_dequant: the bf16 rows the attention kernels read, out of the e4m3 plane. mode 0 (prompt): rows
++    /// [0, POS[0] + rows) direct, the launch covers n_max rows; mode 1 (one stream): program (r, i) of rows x K -
++    /// p < K the prefix at scratch row i, else the selection at r * K + i (TOK' a ramp); mode 2 (a base table):
++    /// every row's keys in its block r * K + i (BASE' a r * K ramp, TOK' a per-row ramp).
++    pub fn kv8Dequant(o: Ops, plane: u64, out: u64, pos: u64, base: u64, tok: u64, rows: usize, k: usize, lw: usize, w: usize, mode: c_int, n_max: usize) !void {
++        if (rows == 0 and mode != 0) return;
++        var a: cuda.Args = .{};
++        a.add(plane);
++        a.add(out);
++        a.add(pos);
++        a.add(base);
++        a.add(tok);
++        a.add(int(rows));
++        a.add(int(k));
++        a.add(int(lw));
++        a.add(int(w));
++        a.add(mode);
++        a.add(@as(i64, @intCast(n_max)));
++        const grid: usize = if (mode == 0) n_max else rows * k;
++        try cuda.launch.launch(o.k.kv8_dequant, .{ .grid = .{ .x = u(grid) }, .block = .{ .x = 128 } }, o.s, &a);
++    }
++
+     /// glm53_l2pf: prefetch `count` (address, bytes) pieces of `table` (int64 pairs) into L2.
+     pub fn l2pf(o: Ops, table: u64, count: usize, mode: c_int, blocks: u32, threads: u32, sink: u64) !void {
+         if (count == 0) return;
+diff --git a/zig/src/families/glm_moe_dsa/cuda_multi.zig b/zig/src/families/glm_moe_dsa/cuda_multi.zig
+index 6e45e3ce..5918d565 100644
+--- a/zig/src/families/glm_moe_dsa/cuda_multi.zig
++++ b/zig/src/families/glm_moe_dsa/cuda_multi.zig
+@@ -285,7 +285,7 @@ pub fn tables(plan: *const Plan, k: usize, BL: usize, local: usize, dd: ?*const
+     var M: usize = 0;
+     var S: usize = 0;
+     for (plan.items[0..plan.n], 0..) |it, q| {
+-        if (it.mode != @intFromEnum(Mode.mtp)) continue; // multi._keeps_mtp
++        if (it.mode != @backingInt(Mode.mtp)) continue; // multi._keeps_mtp
+         if (it.m == 0 or it.m > BL or it.m > it.P) return error.Invalid;
+         for (0..it.m) |i| {
+             if (M >= fw.decode_rows) return error.WindowTooWide;
+@@ -785,7 +785,7 @@ pub const Multi = struct {
+ 
+     /// The caches' bytes a stream holds (multi.nbytes_per_stream: the State's share, the drafters' rings).
+     pub fn bytesPerStream(mu: *const Multi) usize {
+-        var b = fw.State.bytesForDcp(mu.w, mu.r.capacity, mu.r.set.dcp);
++        var b = fw.State.bytesForDcpKv8(mu.w, mu.r.capacity, mu.r.set.dcp, mu.r.set.kv8);
+         for (mu.md) |maybe| {
+             if (maybe) |x| b += x.deviceBytes() / mu.N;
+         }
+@@ -896,7 +896,7 @@ pub const Multi = struct {
+         const c = mu.w.config;
+         const o = mu.ops();
+         const st = &mu.r.st;
+-        const lat = c.latentWidth() * 2;
++        const lat = st.lat_row; // TF_GLM53_KV8: the latent rows are e4m3 + scales (584 B); whole rows copy alike
+         const idx = c.index_dim * 2;
+         // DCP: this rank's share of the state's rows (every rank copies the most any rank holds, as rowViews counts)
+         const m = st.localRows(n);
+@@ -1234,7 +1234,7 @@ pub const Multi = struct {
+                 arm_draft => @min(mu.depthOf(drafterOf(s.mode).?), @min(s.count -| s.out.items.len -| 1, mu.r.capacity -| s.P -| 1)),
+                 else => 0,
+             };
+-            plan.items[plan.n] = .{ .sid = s.sid, .slot = @intCast(s.slot), .P = @intCast(s.P), .tok = s.tok, .m = @intCast(s.m), .mode = @intFromEnum(s.mode), .arm = arm, .room = @intCast(room), .sampled = @intFromBool(s.sampling != null) };
++            plan.items[plan.n] = .{ .sid = s.sid, .slot = @intCast(s.slot), .P = @intCast(s.P), .tok = s.tok, .m = @intCast(s.m), .mode = @backingInt(s.mode), .arm = arm, .room = @intCast(room), .sampled = @intFromBool(s.sampling != null) };
+             plan.n += 1;
+         }
+         if (link) |l| try l.round(l.ctx, &plan);
+@@ -1279,7 +1279,7 @@ pub const Multi = struct {
+         var ss: [max_streams]*Stream = undefined;
+         for (plan.items[0..plan.n], 0..) |it, i| {
+             const s = mu.find(it.sid) orelse return error.OutOfStep;
+-            if (!s.started or s.slot != it.slot or s.P != it.P or s.tok != it.tok or s.m != it.m or @intFromEnum(s.mode) != it.mode) {
++            if (!s.started or s.slot != it.slot or s.P != it.P or s.tok != it.tok or s.m != it.m or @backingInt(s.mode) != it.mode) {
+                 if (!@import("builtin").is_test) std.log.err("rank {d}: stream {d} is at ({d}, {d}, {d}), rank 0's round has ({d}, {d}, {d}): the ranks are out of step; restart all ranks", .{ mu.w.rank, s.sid, s.P, s.tok, s.m, it.P, it.tok, it.m });
+                 return error.OutOfStep;
+             }
+@@ -1463,7 +1463,7 @@ pub const Multi = struct {
+                             var plan: Plan = .{ .n = S };
+                             for (0..S) |i| {
+                                 const ms = M / S + @intFromBool(i < M % S);
+-                                plan.items[i] = .{ .sid = @intCast(i), .slot = @intCast(i), .P = @intCast(P), .tok = 1000, .m = @intCast(ms), .mode = @intFromEnum(Mode.mtp), .arm = arm_mtp, .room = @intCast(mu.k), .sampled = @intCast(sampled) };
++                                plan.items[i] = .{ .sid = @intCast(i), .slot = @intCast(i), .P = @intCast(P), .tok = 1000, .m = @intCast(ms), .mode = @backingInt(Mode.mtp), .arm = arm_mtp, .room = @intCast(mu.k), .sampled = @intCast(sampled) };
+                             }
+                             _ = try mu.gpu(&plan);
+                             try r.f.s.synchronize(); // the pinned tables are written again next
+@@ -1700,7 +1700,7 @@ pub const Multi = struct {
+         const dst = mu.pinSlice(i64, l.cdst, mu.rows);
+         const tok = mu.pinSlice(i64, l.ctok, mu.rows);
+         for (plan.items[0..plan.n], 0..) |it, i| {
+-            if (it.mode != @intFromEnum(Mode.mtp)) continue;
++            if (it.mode != @backingInt(Mode.mtp)) continue;
+             const x = &res[i];
+             for (0..x.n + 1) |q| {
+                 idx[c] = @intCast(t.offs[i] + q);
+@@ -1836,9 +1836,9 @@ test "the device tables' offsets are 16-byte aligned and disjoint" {
+ 
+ test "Phase 4c: drafter streams' windows take the host's drafts; MTP streams keep their backlog rows" {
+     var p: Plan = .{ .n = 3 };
+-    p.items[0] = .{ .sid = 0, .slot = 2, .P = 40, .tok = 7, .m = 1, .mode = @intFromEnum(Mode.dflash), .arm = arm_draft, .room = 7, .sampled = 0 };
+-    p.items[1] = .{ .sid = 1, .slot = 0, .P = 20, .tok = 9, .m = 2, .mode = @intFromEnum(Mode.mtp), .arm = arm_mtp, .room = 2, .sampled = 0 };
+-    p.items[2] = .{ .sid = 2, .slot = 1, .P = 30, .tok = 5, .m = 1, .mode = @intFromEnum(Mode.dspark), .arm = arm_draft, .room = 3, .sampled = 1 };
++    p.items[0] = .{ .sid = 0, .slot = 2, .P = 40, .tok = 7, .m = 1, .mode = @backingInt(Mode.dflash), .arm = arm_draft, .room = 7, .sampled = 0 };
++    p.items[1] = .{ .sid = 1, .slot = 0, .P = 20, .tok = 9, .m = 2, .mode = @backingInt(Mode.mtp), .arm = arm_mtp, .room = 2, .sampled = 0 };
++    p.items[2] = .{ .sid = 2, .slot = 1, .P = 30, .tok = 5, .m = 1, .mode = @backingInt(Mode.dspark), .arm = arm_draft, .room = 3, .sampled = 1 };
+     var dd: Drafts = .{};
+     dd.n[0] = 4;
+     dd.ids[0][0..4].* = .{ 100, 101, 102, 103 };
+@@ -1867,7 +1867,7 @@ test "Phase 4c: modes, the drafter rows and the window with drafters" {
+     try std.testing.expectEqual(@as(?usize, 0), drafterOf(.dflash));
+     try std.testing.expectEqual(@as(?usize, 1), drafterOf(.dspark));
+     try std.testing.expectEqual(@as(?usize, null), drafterOf(.mtp));
+-    try std.testing.expectEqual(@as(?Mode, .dspark), modeOfWord(@intFromEnum(Mode.dspark)));
++    try std.testing.expectEqual(@as(?Mode, .dspark), modeOfWord(@backingInt(Mode.dspark)));
+     try std.testing.expectEqual(@as(?Mode, null), modeOfWord(3));
+     const df: draft.Spec = .{ .kind = .dflash, .D = 6144, .hd = 128, .H = 16, .KV = 2, .I = 3072, .layers = 6, .ntaps = 6, .block = 8, .top_k = 16, .V = 38720, .vocab_off = 0, .rsel = 256, .gs = 16, .eps = 1e-5, .window = 2047, .causal = false, .world = 4, .theta = 1e6, .mask_id = 154856 };
+     var ds = df;
+diff --git a/zig/src/families/glm_moe_dsa/cuda_prompt.zig b/zig/src/families/glm_moe_dsa/cuda_prompt.zig
+index 8b72cb3a..7190df91 100644
+--- a/zig/src/families/glm_moe_dsa/cuda_prompt.zig
++++ b/zig/src/families/glm_moe_dsa/cuda_prompt.zig
+@@ -239,7 +239,7 @@ pub const Prof = struct {
+         w.print("{s} {d:.1} ms:", .{ label, busy }) catch return buf[0..0];
+         for (ms, 0..) |v, i| {
+             if (v == 0) continue;
+-            w.print(" {t} {d:.1}", .{ @as(Phase, @enumFromInt(i)), v }) catch break;
++            w.print(" {t} {d:.1}", .{ @as(Phase, @fromBackingInt(@intCast(i))), v }) catch break;
+         }
+         return w.buffered();
+     }
+@@ -252,7 +252,7 @@ pub const Prof = struct {
+         var comm_ms: [n_phases]f64 = @splat(0);
+         for (p.marks.items) |m| {
+             const ms: f64 = try cuda.Event.elapsedMs(p.pool.items[m.a], p.pool.items[m.b]);
+-            if (m.comm) comm_ms[@intFromEnum(m.ph)] += ms else main_ms[@intFromEnum(m.ph)] += ms;
++            if (m.comm) comm_ms[@backingInt(m.ph)] += ms else main_ms[@backingInt(m.ph)] += ms;
+         }
+         var busy: f64 = 0;
+         for (main_ms, 0..) |v, i| {
+@@ -503,7 +503,14 @@ pub const Sp = struct {
+         try f.pend(p1, .ag);
+         const p2 = try f.pbegin();
+         const m: tri.Mla = .{ .heads = w.heads, .nope = c.nope, .rope = c.rope, .lw = c.kv_lora, .vd = c.v_dim, .topk = c.index_topk };
+-        try t_.kvWrite(b.kva, b.kva_n, L.kv_a_norm, st.kc[li], h.pos, f.inv, c.eps, h.R, m);
++        if (f.kv8) |v| {
++            // TF_GLM53_KV8 (the boot refuses --prompt-sp with it today: this side stream would race the shared
++            // staging; kept correct so a per-stream Kv8 can re-enable it): stage through kv8_stage's tables (the
++            // rope at the TRUE position, §11), then quantize at the true rows
++            try v.stageWrite(f, b, L, st.kc[li], h.pos, 0, h.R, false);
++        } else {
++            try t_.kvWrite(b.kva, b.kva_n, L.kv_a_norm, st.kc[li], h.pos, f.inv, c.eps, h.R, m);
++        }
+         const ix = if (L.indexer) |*x| x else return f.pend(p2, .kv_write);
+         try t_.ikWrite(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, st.ic[li], h.pos, h.R, c.index_dim, c.rope);
+         try f.pend(p2, .kv_write);
+diff --git a/zig/src/families/glm_moe_dsa/cuda_reuse.zig b/zig/src/families/glm_moe_dsa/cuda_reuse.zig
+index 8d71b47e..c0b5aebc 100644
+--- a/zig/src/families/glm_moe_dsa/cuda_reuse.zig
++++ b/zig/src/families/glm_moe_dsa/cuda_reuse.zig
+@@ -597,13 +597,15 @@ pub const View = struct { ptr: u64, row: usize, rows: usize };
+ /// prefixes.row_views: the cache rows a state of n tokens reads - every layer's latent rows of positions < n, then
+ /// the index keys of the full-indexer layers, then the MTP layer's latent and index keys of positions < n - 1. DCP: a
+ /// rank holds positions p % dcp == rank at p / dcp; every rank takes ceil(n / dcp) rows (the most any rank has).
++/// TF_GLM53_KV8: the latent rows are e4m3 + two fp32 scales (st.lat_row, 584 B) - one plane a layer still, so the
++/// save / load machinery is unchanged; a file of the other row size is refused by its size table (StateRefused).
+ pub fn rowViews(gpa: std.mem.Allocator, st: *const fw.State, c: anytype, n: usize, dcp: usize) ![]View {
+     const m = (n + dcp - 1) / dcp;
+     const n1 = if (n > 0) n - 1 else 0;
+     const mm = (n1 + dcp - 1) / dcp;
+     var out: std.ArrayList(View) = .empty;
+     errdefer out.deinit(gpa);
+-    const lat = c.latentWidth() * 2;
++    const lat = st.lat_row;
+     const idx = c.index_dim * 2;
+     for (st.kc) |p| try out.append(gpa, .{ .ptr = p, .row = lat, .rows = m });
+     for (st.ic) |p| if (p != 0) try out.append(gpa, .{ .ptr = p, .row = idx, .rows = m });
+diff --git a/zig/src/families/glm_moe_dsa/cuda_runner.zig b/zig/src/families/glm_moe_dsa/cuda_runner.zig
+index 317e7263..87e3ab2b 100644
+--- a/zig/src/families/glm_moe_dsa/cuda_runner.zig
++++ b/zig/src/families/glm_moe_dsa/cuda_runner.zig
+@@ -77,6 +77,10 @@ pub const Settings = struct {
+     /// Phase 4b (--parallel N): the caches hold this many streams' slots (fused.State(slots=N)); `run` uses slot 0,
+     /// cuda_multi.zig drives the rest (under DCP too: each slot this rank's shard of its stream).
+     slots: usize = 1,
++    /// TF_GLM53_KV8: the latent cache's rows as e4m3 + two fp32 scales (584 bytes; DCP 1 only) - the staged
++    /// quantize / dequantize around the unchanged Triton kernels (findings-kv8.md). Lossy: bits differ from the
++    /// bf16 cache; per-mode determinism holds within one setting.
++    kv8: bool = false,
+ };
+ 
+ /// What drafts a request's rounds (runner.set_mode: the MTP head, DSpark, DFlash2).
+@@ -313,7 +317,7 @@ pub const Runner = struct {
+         r.copy_on = copy_on;
+         r.solo_feed = true;
+         const shared = f.shared_experts;
+-        r.st = try fw.State.initSlots(gpa, d, w, capacity, set.dcp, set.slots);
++        r.st = try fw.State.initSlotsKv8(gpa, d, w, capacity, set.dcp, set.slots, set.kv8);
+         errdefer r.st.deinit();
+         if (set.served) {
+             // Runner.__init__: pb (prompt_rows, exact key range), pb1 (the second micro-batch) when chunks overlap
+@@ -453,7 +457,7 @@ pub const Runner = struct {
+     /// Runner._verify: the target over vb.ids[:R] at P (logits "all", head `pick`).
+     fn verify(r: *Runner, R: usize, P: usize, T: ?usize, pick: Pick) !void {
+         try r.setI32(r.st.pos, P);
+-        const key: u64 = 1 | (@as(u64, R) << 4) | (tIndex(T) << 12) | (@as(u64, @intFromEnum(pick)) << 20);
++        const key: u64 = 1 | (@as(u64, R) << 4) | (tIndex(T) << 12) | (@as(u64, @backingInt(pick)) << 20);
+         try r.runGraph(key, VerifyCtx{ .r = r, .R = R, .T = T, .pick = pick });
+     }
+ 
+diff --git a/zig/src/families/glm_moe_dsa/cuda_weights.zig b/zig/src/families/glm_moe_dsa/cuda_weights.zig
+index 3975c6a1..ddb6e5b7 100644
+--- a/zig/src/families/glm_moe_dsa/cuda_weights.zig
++++ b/zig/src/families/glm_moe_dsa/cuda_weights.zig
+@@ -25,6 +25,18 @@ const headq = @import("headq.zig");
+ 
+ const Tensor = core.checkpoint.Tensor;
+ const config_max_layers = @import("config.zig").max_layers;
++
++/// One-time log latches for the fp16 -> bf16 round casts (the 4.04bpw-h8 pack stores the
++/// bf-named non-scale tensors as fp16; the loader is single-threaded per rank process).
++const RoundCastLogged = struct {
++    var kv_b: bool = false;
++    var gate: bool = false;
++    var idx_wk: bool = false;
++    var idx_weights_proj: bool = false;
++    var idx_k_norm_w: bool = false;
++    var idx_k_norm_b: bool = false;
++};
++
+ pub const Experts = kern.Experts;
+ 
+ pub const Mlp = struct { gate: exl3.Linear, up: exl3.Linear, down: exl3.Linear };
+@@ -364,6 +376,31 @@ const Loader = struct {
+         return L.put(key, out);
+     }
+ 
++    /// weights.as_bf16 with the capture-side round cast: bf16 as stored; fp16 round-to-nearest-even
++    /// to bf16 (bf16Bits — torch's .to(bfloat16), the exact values the world-8 AOT capture compiled
++    /// against). For the bf-named tensors the 4.04bpw-h8 pack stores as fp16 (router gate, indexer
++    /// wk / weights_proj / k_norm). Logs once per class per process.
++    fn bf16Round(L: *Loader, name: []const u8, key: []const u8, latch: *bool, class: []const u8) !u64 {
++        const t = try L.get(name);
++        if (t.dtype == .bf16) {
++            var shape: [core.safetensors.max_rank]usize = undefined;
++            return L.put(key, try L.part(name, &shape));
++        }
++        if (t.dtype != .f16) return error.UnexpectedTensor;
++        var shape: [core.safetensors.max_rank]usize = undefined;
++        const raw = try L.part(name, &shape);
++        const out = try staging(&L.host, L.gpa, raw.len);
++        for (0..raw.len / 2) |i| {
++            const h: f16 = @bitCast(std.mem.readInt(u16, raw[2 * i ..][0..2], .little));
++            std.mem.writeInt(u16, out[2 * i ..][0..2], bf16Bits(@as(f32, h)), .little);
++        }
++        if (!latch.*) {
++            std.log.info("glm53: {s}: fp16 storage -> bf16 round cast (torch .to(bfloat16); the AOT capture compiled these values)", .{class});
++            latch.* = true;
++        }
++        return L.put(key, out);
++    }
++
+     /// `.float()` of a bf16 / fp32 vector (the router's score-correction bias).
+     fn f32vec(L: *Loader, name: []const u8, key: []const u8) !u64 {
+         const t = try L.get(name);
+@@ -442,7 +479,8 @@ const Loader = struct {
+     /// fused.Weights: kv_b [H (nope + v), kv_lora] -> wk [H, nope, kv_lora] and wv [H, v, kv_lora], contiguous.
+     fn kvB(L: *Loader, name: []const u8, key: []const u8, c: Config, heads: usize) ![2]u64 {
+         const t = try L.get(name);
+-        if (t.dtype != .bf16) return error.UnexpectedTensor;
++        // the 4.04bpw-h8 pack stores kv_b_proj as fp16: accepted with the capture-side round cast
++        if (t.dtype != .bf16 and t.dtype != .f16) return error.UnexpectedTensor;
+         var shape: [core.safetensors.max_rank]usize = undefined;
+         const raw = try L.part(name, &shape);
+         const per = c.nope + c.v_dim;
+@@ -458,9 +496,28 @@ const Loader = struct {
+         }
+         const wk = try staging(&L.host, L.gpa, heads * c.nope * row);
+         const wv = try staging(&L.host2, L.gpa, heads * c.v_dim * row);
++        const f16in = t.dtype == .f16;
+         for (0..heads) |h| {
+-            @memcpy(wk[h * c.nope * row ..][0 .. c.nope * row], src[h * per * row ..][0 .. c.nope * row]);
+-            @memcpy(wv[h * c.v_dim * row ..][0 .. c.v_dim * row], src[(h * per + c.nope) * row ..][0 .. c.v_dim * row]);
++            if (f16in) {
++                // fp16 storage: round-cast per element while splitting the blocks (bf16Bits = torch .to(bfloat16),
++                // the values the AOT capture compiled; byte layout is identical, only the element decode differs)
++                for (0..c.nope * c.kv_lora) |i| {
++                    const v: f16 = @bitCast(std.mem.readInt(u16, src[(h * per * c.kv_lora + i) * 2 ..][0..2], .little));
++                    std.mem.writeInt(u16, wk[(h * c.nope * c.kv_lora + i) * 2 ..][0..2], bf16Bits(@as(f32, v)), .little);
++                }
++                const off = (h * per + c.nope) * c.kv_lora;
++                for (0..c.v_dim * c.kv_lora) |i| {
++                    const v: f16 = @bitCast(std.mem.readInt(u16, src[(off + i) * 2 ..][0..2], .little));
++                    std.mem.writeInt(u16, wv[(h * c.v_dim * c.kv_lora + i) * 2 ..][0..2], bf16Bits(@as(f32, v)), .little);
++                }
++            } else {
++                @memcpy(wk[h * c.nope * row ..][0 .. c.nope * row], src[h * per * row ..][0 .. c.nope * row]);
++                @memcpy(wv[h * c.v_dim * row ..][0 .. c.v_dim * row], src[(h * per + c.nope) * row ..][0 .. c.v_dim * row]);
++            }
++        }
++        if (f16in and !RoundCastLogged.kv_b) {
++            std.log.info("glm53: self_attn.kv_b_proj.weight: fp16 storage -> bf16 round cast (torch .to(bfloat16); the AOT capture compiled these values)", .{});
++            RoundCastLogged.kv_b = true;
+         }
+         var kb: [128]u8 = undefined;
+         const a = try L.put(try std.fmt.bufPrint(&kb, "{s}.wk", .{key}), wk);
+@@ -872,17 +929,17 @@ const Loader = struct {
+         if (L.has(try at.n(&nb, p, "self_attn.indexer.wq_b.trellis"))) {
+             out.indexer = .{
+                 .wq_b = try L.linear(try at.n(&nb, p, "self_attn.indexer.wq_b"), try at.n(&kb, key, "wq_b")),
+-                .wk = try L.bf16(try at.n(&nb, p, "self_attn.indexer.wk.weight"), try at.n(&kb, key, "idx.wk")),
+-                .weights_proj = try L.bf16(try at.n(&nb, p, "self_attn.indexer.weights_proj.weight"), try at.n(&kb, key, "idx.weights_proj")),
+-                .k_norm_w = try L.bf16(try at.n(&nb, p, "self_attn.indexer.k_norm.weight"), try at.n(&kb, key, "idx.k_norm_w")),
+-                .k_norm_b = try L.bf16(try at.n(&nb, p, "self_attn.indexer.k_norm.bias"), try at.n(&kb, key, "idx.k_norm_b")),
++                .wk = try L.bf16Round(try at.n(&nb, p, "self_attn.indexer.wk.weight"), try at.n(&kb, key, "idx.wk"), &RoundCastLogged.idx_wk, "self_attn.indexer.wk.weight"),
++                .weights_proj = try L.bf16Round(try at.n(&nb, p, "self_attn.indexer.weights_proj.weight"), try at.n(&kb, key, "idx.weights_proj"), &RoundCastLogged.idx_weights_proj, "self_attn.indexer.weights_proj.weight"),
++                .k_norm_w = try L.bf16Round(try at.n(&nb, p, "self_attn.indexer.k_norm.weight"), try at.n(&kb, key, "idx.k_norm_w"), &RoundCastLogged.idx_k_norm_w, "self_attn.indexer.k_norm.weight"),
++                .k_norm_b = try L.bf16Round(try at.n(&nb, p, "self_attn.indexer.k_norm.bias"), try at.n(&kb, key, "idx.k_norm_b"), &RoundCastLogged.idx_k_norm_b, "self_attn.indexer.k_norm.bias"),
+             };
+         }
+         out.router_w = 0;
+         out.router_bias = 0;
+         out.experts = null;
+         if (c.isMoe(i)) {
+-            out.router_w = try L.bf16(try at.n(&nb, p, "mlp.gate.weight"), try at.n(&kb, key, "router.weight"));
++            out.router_w = try L.bf16Round(try at.n(&nb, p, "mlp.gate.weight"), try at.n(&kb, key, "router.weight"), &RoundCastLogged.gate, "mlp.gate.weight");
+             out.router_bias = try L.f32vec(try at.n(&nb, p, "mlp.gate.e_score_correction_bias"), try at.n(&kb, key, "router.bias"));
+             out.experts = try L.experts(i, key, c);
+             out.mlp = try L.mlp(try at.n(&nb, p, "mlp.shared_experts"), try at.n(&kb, key, "mlp"));
+diff --git a/zig/kernels/cuda/glm53_kv8.cu b/zig/kernels/cuda/glm53_kv8.cu
+new file mode 100644
+index 00000000..76c72e59
+--- /dev/null
++++ b/zig/kernels/cuda/glm53_kv8.cu
+@@ -0,0 +1,155 @@
++// GLM-5.3 8-bit KV cache (TF_GLM53_KV8, ours): the MLA latent cache's rows as e4m3 codes with two fp32 scales a
++// row (one the latent half, one the shared rope half - capture.py's absmax/448 per-row pattern). The plane's row is
++// W = LW + RD bytes of codes followed by the two scales (row stride W + 8 bytes); the indexer's K cache stays bf16
++// (the DSA top-k scoring reads all of it every step - quantized scores would move the selected SET, not just the
++// values; no lineage precedent covers it, and it is 22 x 256 B of the 94.4 KiB a token takes in bf16).
++//
++//   glm53_kv8_quant: a window's written rows sit in a bf16 staging buffer as rows 0..R-1 (the unchanged Triton
++//     _kv_write put them there: glm53_kv8_stage's tables give row r at staging row r, the rope rotated at the
++//     row's TRUE position); one program a row finds its destination row exactly
++//     as _kv_write would have (non-ROWS: POS[0] + r; ROWS: BASE[r] + POS[r] - the TRUE tables), takes the two
++//     halves' absmax, writes scale = absmax/448 (1.0 when 0) and the e4m3 codes. Deterministic.
++//   glm53_kv8_dequant: materializes the bf16 rows the unchanged Triton attention kernels read, into a scratch:
++//     mode 0 (prompt / wide windows): rows [0, POS[0] + R) direct - the kernels read keys 0..p with no TOK/BASE,
++//     so the scratch mirrors the plane; the launch covers n_max rows and each program leaves when it is past the
++//     end (the position lives on the device: graph-safe callers never use this mode).
++//     mode 1 (one stream's decode window): program (r, i) of R x K - p = POS[0] + r; while p < K the kernel reads
++//     keys 0..p directly, so rows i <= p land at scratch row i (the shared prefix region [0, K)); past K it reads
++//     TOK[r*K + i], so the selection lands at scratch row r*K + i (row r's block). The launch passes TOK' = a ramp
++//     (r*K + i), which points the kernel at exactly those blocks; rows with p < K never consult TOK'. The prefix
++//     region and row 0's block are the same rows [0, K), but a row reads one or the other, never both.
++//     mode 2 (--parallel N, a base table): p = POS[r], the row's stream's rows at BASE[r]; every row's keys land in
++//     its own block r*K + i (the kernel takes BASE' = a r*K ramp and TOK' = a per-row ramp, so both its p < K and
++//     its TOK reads stay inside the block).
++//   Several programs may write the same scratch row with the same bytes (mode 1's shared prefix): the writes are
++//   identical, so the result does not depend on the order they land.
++//
++// e4m3 is torch.float8_e4m3fn: __nv_cvt_float_to_fp8 with __NV_SATFINITE (no inf, max 448) and back.
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <cstdint>
++
++namespace {
++constexpr float FP8_MAX = 448.0f;
++
++__device__ __forceinline__ float bf16_at(const unsigned short* s, size_t i) {
++    return __bfloat162float(__ushort_as_bfloat16(s[i]));
++}
++
++__device__ __forceinline__ void put_bf16(unsigned short* d, size_t i, float v) {
++    d[i] = __bfloat16_as_ushort(__float2bfloat16(v));
++}
++
++// the plane's row stride in bytes: W codes then the two scales
++__device__ __forceinline__ size_t row_bytes(int w) { return (size_t)w + 8; }
++}  // namespace
++
++// Grid (rows), 128 threads. The staging write's position / base tables (THE ROPE FIX, findings-kv8.md §11):
++// _kv_write rotates the rope half of its row at the row's TRUE position (fused.py: ang_p = pg), so the staging
++// redirect must NOT zero it. The ROWS variant already decouples the two: the angle comes from POS[r] alone and
++// the write row is BASE[r] + POS[r]. This builds P'[r] = the row's true position (rows_mode: POS[r], else
++// POS[0] + r) and B'[r] = r - P'[r], so _kv_write ROWS writes staging row r while rotating at the true position -
++// the staged row is bit-identical to what the bf16 cache would hold, and the quantizer is unchanged.
++extern "C" __global__ void __launch_bounds__(128)
++glm53_kv8_stage(const int* __restrict__ POS, int* __restrict__ spos, int* __restrict__ sbase, int rows, int ROWS_MODE) {
++    const int r = blockIdx.x * blockDim.x + threadIdx.x;
++    if (r >= rows) return;
++    const long long p = ROWS_MODE ? (long long)POS[r] : (long long)POS[0] + r;
++    spos[r] = (int)p;
++    sbase[r] = (int)((long long)r - p);
++}
++
++// Grid (rows), 128 threads. stage: bf16 [rows, W]; plane: rows of W code bytes + 2 fp32 scales.
++// ROWS_MODE: dest = BASE[r] + POS[r]; else dest = POS[0] + r (as _kv_write places the row).
++extern "C" __global__ void __launch_bounds__(128)
++glm53_kv8_quant(const unsigned short* __restrict__ stage, unsigned char* __restrict__ plane,
++                const int* __restrict__ POS, const int* __restrict__ BASE, int rows, int ROWS_MODE, int LW, int W) {
++    const int r = blockIdx.x, t = threadIdx.x;
++    if (r >= rows) return;
++    const long long dest = ROWS_MODE ? (long long)BASE[r] + (long long)POS[r] : (long long)POS[0] + r;
++    const unsigned short* s = stage + (size_t)r * (size_t)W;
++    unsigned char* d = plane + (size_t)dest * row_bytes(W);
++    float* sc = (float*)(d + W);
++    // the two halves' absmax
++    float am0 = 0.0f, am1 = 0.0f;
++    for (int i = t; i < W; i += 128) {
++        const float v = fabsf(bf16_at(s, (size_t)i));
++        if (i < LW) { if (v > am0) am0 = v; } else { if (v > am1) am1 = v; }
++    }
++    __shared__ float red[128];
++    red[t] = am0;
++    __syncthreads();
++    if (t == 0) {
++        for (int i = 1; i < 128; i++) if (red[i] > red[0]) red[0] = red[i];
++    }
++    __syncthreads();
++    am0 = red[0];
++    __syncthreads();
++    red[t] = am1;
++    __syncthreads();
++    if (t == 0) {
++        for (int i = 1; i < 128; i++) if (red[i] > red[0]) red[0] = red[i];
++        const float s0 = am0 > 0.0f ? am0 / FP8_MAX : 1.0f;
++        const float s1 = red[0] > 0.0f ? red[0] / FP8_MAX : 1.0f;
++        sc[0] = s0;
++        sc[1] = s1;
++    }
++    __syncthreads();
++    const float s0 = sc[0], s1 = sc[1];
++    for (int i = t; i < W; i += 128)
++        d[i] = __nv_cvt_float_to_fp8(bf16_at(s, (size_t)i) / (i < LW ? s0 : s1), __NV_SATFINITE, __NV_E4M3);
++}
++
++// Grid (n_max) mode 0 / grid (rows * K) modes 1-2, 128 threads. One program one 576-byte row: 144 words of four
++// codes, the half's scale picked per element (LW is a whole number of words: 512 = 128 words).
++extern "C" __global__ void __launch_bounds__(128)
++glm53_kv8_dequant(const unsigned char* __restrict__ plane, unsigned short* __restrict__ out,
++                  const int* __restrict__ POS, const int* __restrict__ BASE, const int* __restrict__ TOK,
++                  int rows, int K, int LW, int W, int mode, long long n_max) {
++    long long src, dst;
++    if (mode == 0) {
++        const long long i = blockIdx.x;
++        if (i >= n_max || i >= (long long)POS[0] + rows) return;
++        src = i;
++        dst = i;
++    } else {
++        const long long p = blockIdx.x;
++        const long long r = p / K, i = p % K;
++        if (r >= rows) return;
++        if (mode == 2) {
++            const long long pr = (long long)POS[r], base = (long long)BASE[r];
++            if (pr < K) {
++                if (i > pr) return;
++                src = base + i;
++            } else {
++                src = base + (long long)TOK[r * K + i];
++            }
++            dst = r * K + i;
++        } else {
++            const long long pr = (long long)POS[0] + r;
++            if (pr < K) {
++                if (i > pr) return;
++                src = i;
++                dst = i; // the shared prefix: while p < K the kernel reads key idx flat, TOK' never consulted
++            } else {
++                src = (long long)TOK[r * K + i];
++                dst = r * K + i; // past K the identity ramp (TOK' = r*K + i) points the kernel at row r's block
++            }
++        }
++    }
++    const unsigned char* s = plane + (size_t)src * row_bytes(W);
++    const float* sc = (const float*)(s + W);
++    const float s0 = sc[0], s1 = sc[1];
++    unsigned short* d = out + (size_t)dst * (size_t)W;
++    const int words = W / 4;
++    for (int w = threadIdx.x; w < words; w += 128) {
++        const unsigned u = *(const unsigned*)(s + 4 * (size_t)w);
++        for (int j = 0; j < 4; j++) {
++            const int e = 4 * w + j;
++            __nv_fp8_e4m3 code;
++            code.__x = (unsigned char)(u >> (8 * j));
++            const float v = (float)code * (e < LW ? s0 : s1);
++            put_bf16(d, (size_t)e, v);
++        }
++    }
++}
+diff --git a/zig/tests/cuda/kv8repro.zig b/zig/tests/cuda/kv8repro.zig
+new file mode 100644
+index 00000000..d7534f73
+--- /dev/null
++++ b/zig/tests/cuda/kv8repro.zig
+@@ -0,0 +1,227 @@
++//! kv8repro: TF_GLM53_KV8's write/read chain against the bf16 path it wraps, self-consistent, no model needed.
++//! Usage: kv8repro <aot dir> [--pos N] [--rows R]
++//!
++//! The parallel-8 serve exercises the ROWS (base-table) kv8 path every decode window - that path is proven
++//! healthy on the live boot. The PROMPT path (a stream's slot view, base 0) is the only place the NON-ROWS
++//! chain runs: kv8_stage(ROWS_MODE=0) -> _kv_write ROWS with (P', B') -> kv8_quant(rows_mode=0) ->
++//! kv8_dequant(mode 1) -> _attn_chunks over the block scratch. This reproduces that chain with synthetic rows
++//! and gates it against the bf16 semantics:
++//!   1. the staged rows must be BIT-IDENTICAL to what the bf16 non-ROWS _kv_write puts in a real cache at the
++//!      same positions (the whole point of the staging tables - the rope at the TRUE position);
++//!   2. the stage tables must be P'[r] = pos + r, B'[r] = r - P'[r];
++//!   3. dequant(quant(staging)) must round-trip within e4m3 (and the scratch rows must equal the plane's
++//!      dequantized rows exactly - the mode-1 direct region the p < K attention reads).
++//! Prints PASS/FAIL per gate; exit 0 only on PASS.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm53");
++
++const usage = "usage: kv8repro <aot dir> [--pos N] [--rows R]\n";
++
++const lw = 512;
++const rd = 64;
++const w576 = lw + rd;
++const k_sel = 2048;
++
++pub fn main(init: std.process.Init) !u8 {
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len < 2) {
++        std.debug.print("{s}", .{usage});
++        return 2;
++    }
++    var pos: usize = 0;
++    var rows: usize = 24;
++    var i: usize = 2;
++    while (i < args.len) : (i += 1) {
++        if (std.mem.eql(u8, args[i], "--pos") and i + 1 < args.len) {
++            pos = try std.fmt.parseInt(usize, args[i + 1], 10);
++            i += 1;
++        } else if (std.mem.eql(u8, args[i], "--rows") and i + 1 < args.len) {
++            rows = try std.fmt.parseInt(usize, args[i + 1], 10);
++            i += 1;
++        } else {
++            std.debug.print("{s}", .{usage});
++            return 2;
++        }
++    }
++    const ok = run(init.gpa, init.io, args[1], pos, rows) catch |e| {
++        std.debug.print("RESULT kv8repro FAIL error {t}\n", .{e});
++        return 1;
++    };
++    return if (ok) 0 else 1;
++}
++
++fn run(gpa: std.mem.Allocator, io: std.Io, aot: []const u8, pos: usize, R: usize) !bool {
++    if (R == 0 or pos + R > 100_000) return error.Invalid;
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var k = try glm.kernels.Kernels.load(gpa, io, &ctx, aot);
++    defer k.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    const o = glm.kernels.Ops{ .k = &k, .s = stream };
++    const t = glm.triton.Tri{ .set = &k.triton, .s = stream };
++    const m: glm.triton.Mla = .{ .heads = 8, .nope = 192, .rope = rd, .lw = lw, .vd = 256, .topk = k_sel };
++
++    // synthetic inputs: kva rows [R, 576] bf16, kv_a_norm [512], inv_freq [32], the position word
++    const host_kva = try gpa.alloc(u16, R * w576);
++    defer gpa.free(host_kva);
++    for (host_kva, 0..) |*x, i| {
++        const r = i / w576;
++        const c = @mod(i, w576);
++        const v: f32 = @sin(@as(f32, @floatFromInt(r)) * 0.37 + @as(f32, @floatFromInt(c)) * 0.011) * 3.0 + 0.1;
++        x.* = @bitCast(glm.weights.bf16Bits(v));
++    }
++    const host_nw = try gpa.alloc(u16, lw);
++    defer gpa.free(host_nw);
++    for (host_nw, 0..) |*x, j| x.* = @bitCast(glm.weights.bf16Bits(1.0 + 0.001 * @as(f32, @floatFromInt(j))));
++    var host_inv: [rd / 2]f32 = undefined;
++    for (&host_inv, 0..) |*x, j| x.* = @floatCast(std.math.pow(f64, 10000.0, -2.0 * @as(f64, @floatFromInt(j)) / rd));
++
++    var d_kva = try cuda.DeviceBuffer.fromHost(&driver, std.mem.sliceAsBytes(host_kva));
++    defer d_kva.free();
++    var d_nw = try cuda.DeviceBuffer.fromHost(&driver, std.mem.sliceAsBytes(host_nw));
++    defer d_nw.free();
++    var d_inv = try cuda.DeviceBuffer.fromHost(&driver, std.mem.sliceAsBytes(host_inv[0..]));
++    defer d_inv.free();
++    var d_pos = try cuda.DeviceBuffer.alloc(&driver, 4);
++    defer d_pos.free();
++    {
++        const p: i32 = @intCast(pos);
++        try d_pos.upload(0, std.mem.asBytes(&p));
++    }
++    var d_zero = try cuda.DeviceBuffer.alloc(&driver, 4 * 256);
++    defer d_zero.free();
++    try d_zero.fill8(0, null);
++
++    const cache_rows = pos + R;
++    // the bf16 reference cache: _kv_write NON-ROWS at the true position (the path the bf16 serve runs)
++    var d_ref = try cuda.DeviceBuffer.alloc(&driver, cache_rows * w576 * 2);
++    defer d_ref.free();
++    try d_ref.fill8(0, null);
++    // the kv8 side: staging, the plane (584-B rows), the block scratch, the stage tables
++    var d_stage = try cuda.DeviceBuffer.alloc(&driver, R * w576 * 2);
++    defer d_stage.free();
++    var d_plane = try cuda.DeviceBuffer.alloc(&driver, cache_rows * (w576 + 8));
++    defer d_plane.free();
++    try d_plane.fill8(0, null);
++    var d_scratch = try cuda.DeviceBuffer.alloc(&driver, R * k_sel * w576 * 2);
++    defer d_scratch.free();
++    var d_spos = try cuda.DeviceBuffer.alloc(&driver, 256 * 4);
++    defer d_spos.free();
++    var d_sbase = try cuda.DeviceBuffer.alloc(&driver, 256 * 4);
++    defer d_sbase.free();
++
++    // ---- the bf16 reference write: non-ROWS, the real cache, POS = the position word
++    try t.kvWriteDcp(d_kva.ptr, w576, d_nw.ptr, d_ref.ptr, d_pos.ptr, d_inv.ptr, 1e-5, R, m, 1, 0);
++
++    // ---- the kv8 staged write: the tables, then _kv_write ROWS into the staging buffer
++    try o.kv8Stage(d_spos.ptr, d_sbase.ptr, d_pos.ptr, R, false);
++    try t.kvWriteRowsDcp(d_kva.ptr, w576, d_nw.ptr, d_stage.ptr, d_spos.ptr, d_sbase.ptr, d_inv.ptr, 1e-5, R, m, 1, 0);
++    try o.kv8Quant(d_stage.ptr, d_plane.ptr, d_pos.ptr, 0, R, false, lw, w576);
++
++    // ---- the read: mode 1 (the prompt window's shape: p = pos + r, the direct region while p < K)
++    try o.kv8Dequant(d_plane.ptr, d_scratch.ptr, d_pos.ptr, d_zero.ptr, d_zero.ptr, R, k_sel, lw, w576, 1, 0);
++    try stream.synchronize();
++
++    // ---- gate 1: the stage tables
++    var ok = true;
++    {
++        const spos = try gpa.alloc(i32, 256);
++        defer gpa.free(spos);
++        const sbase = try gpa.alloc(i32, 256);
++        defer gpa.free(sbase);
++        try d_spos.download(0, std.mem.sliceAsBytes(spos));
++        try d_sbase.download(0, std.mem.sliceAsBytes(sbase));
++        var bad: usize = 0;
++        for (0..R) |r| {
++            if (spos[r] != @as(i32, @intCast(pos + r))) bad += 1;
++            if (sbase[r] != @as(i32, @intCast(r)) - spos[r]) bad += 1;
++        }
++        if (bad == 0) {
++            std.debug.print("PASS stage tables: P'[r] = pos + r, B'[r] = r - P'\n", .{});
++        } else {
++            ok = false;
++            std.debug.print("FAIL stage tables: {d} wrong entries (P'[0]={d} B'[0]={d}, pos={d})\n", .{ bad, spos[0], sbase[0], pos });
++        }
++    }
++
++    // ---- gate 2: the staged rows bit-identical to the bf16 cache's rows at the same positions
++    {
++        const stage = try gpa.alloc(u8, R * w576 * 2);
++        defer gpa.free(stage);
++        const ref = try gpa.alloc(u8, cache_rows * w576 * 2);
++        defer gpa.free(ref);
++        try d_stage.download(0, stage);
++        try d_ref.download(0, ref);
++        var bad: usize = 0;
++        var first: usize = 0;
++        for (0..R) |r| {
++            const a = stage[r * w576 * 2 ..][0 .. w576 * 2];
++            const b = ref[(pos + r) * w576 * 2 ..][0 .. w576 * 2];
++            if (!std.mem.eql(u8, a, b)) {
++                bad += 1;
++                if (bad == 1) first = r;
++            }
++        }
++        if (bad == 0) {
++            std.debug.print("PASS staged rows: bit-identical to the bf16 cache rows (rope at the true position)\n", .{});
++        } else {
++            ok = false;
++            var ca: u16 = 0;
++            var cb: u16 = 0;
++            {
++                const a = stage[first * w576 * 2 ..][0 .. w576 * 2];
++                const b = ref[(pos + first) * w576 * 2 ..][0 .. w576 * 2];
++                ca = std.mem.bytesAsSlice(u16, a)[0];
++                cb = std.mem.bytesAsSlice(u16, b)[0];
++            }
++            std.debug.print("FAIL staged rows: {d} of {d} differ (first row {d}: staging {x} vs bf16 {x})\n", .{ bad, R, first, ca, cb });
++        }
++    }
++
++    // ---- gate 3: the roundtrip - the mode-1 scratch's direct region vs the bf16 reference, within e4m3
++    {
++        const scratch = try gpa.alloc(u8, R * k_sel * w576 * 2);
++        defer gpa.free(scratch);
++        const ref = try gpa.alloc(u8, cache_rows * w576 * 2);
++        defer gpa.free(ref);
++        try d_scratch.download(0, scratch);
++        try d_ref.download(0, ref);
++        var worst: f32 = 0;
++        var bad: usize = 0;
++        var first: usize = 0;
++        // the p < K direct region: scratch row i holds plane row i; every row r reads keys 0..pos + r
++        for (0..R) |r| {
++            const p = pos + r;
++            if (p >= k_sel) break; // past K the block region takes over; the live short-prompt case is all-direct
++            for (0..p + 1) |i| {
++                const a = std.mem.bytesAsSlice(u16, scratch[i * w576 * 2 ..][0 .. w576 * 2]);
++                const b = std.mem.bytesAsSlice(u16, ref[i * w576 * 2 ..][0 .. w576 * 2]);
++                for (0..w576) |c| {
++                    const va: f32 = @bitCast(@as(u32, a[c]) << 16);
++                    const vb: f32 = @bitCast(@as(u32, b[c]) << 16);
++                    const denom = @max(@abs(vb), 1e-3);
++                    const rel = @abs(va - vb) / denom;
++                    if (rel > worst) worst = rel;
++                    if (rel > 0.20) { // e4m3 with per-row scales: ~6% typical, subnormal tails wider
++                        bad += 1;
++                        if (bad == 1) first = i * w576 + c;
++                    }
++                }
++            }
++        }
++        if (bad == 0) {
++            std.debug.print("PASS roundtrip: the scratch's direct region matches the bf16 rows (worst rel {d:.4})\n", .{worst});
++        } else {
++            ok = false;
++            std.debug.print("FAIL roundtrip: {d} values past 20% rel (worst {d:.4}, first at flat {d})\n", .{ bad, worst, first });
++        }
++    }
++
++    std.debug.print("RESULT kv8repro {s} pos={d} rows={d}\n", .{ if (ok) "PASS" else "FAIL", pos, R });
++    return ok;
++}

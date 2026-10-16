@@ -1,0 +1,144 @@
+--- zig/src/families/glm_moe_dsa/cuda_mdraft.zig.bak	2026-10-16 09:37:17.029781627 +0300
++++ zig/src/families/glm_moe_dsa/cuda_mdraft.zig	2026-10-16 09:37:37.259146177 +0300
+@@ -39,8 +39,11 @@
+ /// The widest pass (qmm_group's 4-bit tiles take up to 64 rows): N streams' blocks side by side, a context update.
+ pub const max_pass_rows: usize = draft.tap_rows;
+ 
+-/// Rows a stream's verify window takes with this drafter at N streams (multi.frows): its most drafts and the pending
+-/// token, at most a decode window's share (4 streams: 8 rows - 7 drafts).
++/// Rows a stream's verify window takes with this drafter at N streams sharing the decode window: its most drafts and
++/// the pending token, at most the window's share (4 streams: 8 rows - 7 drafts). N is the CONFIGURED parallel where
++/// this sizes the pool, the buffers and the prewarm widths (multi.frows / fits / drafterRows), and the round's LIVE
++/// stream count where it caps a round's drafts (Multi.depthOf: adaptive frows - a lone stream drafts to the drafter's
++/// most, a full round takes the configured share; the budget N x max(k + 1, frows) <= decode_rows holds for both).
+ pub fn frows(sp: draft.Spec, N: usize) usize {
+     return @min(sp.maxDepth() + 1, fw.decode_rows / @max(N, 1));
+ }
+@@ -614,6 +617,9 @@
+     try std.testing.expectEqual(@as(usize, 8), frows(df, 4)); // block 8 = pending + 7 drafts
+     try std.testing.expectEqual(@as(usize, 8), frows(ds, 4)); // block + 1 = 9, capped at 32 / 4
+     try std.testing.expectEqual(@as(usize, 9), frows(ds, 2));
++    try std.testing.expectEqual(@as(usize, 9), frows(ds, 1)); // adaptive: a lone stream takes the whole window
++    try std.testing.expectEqual(@as(usize, 9), frows(ds, 3)); // 32 / 3 = 10 -> the drafter's most
++    try std.testing.expectEqual(@as(usize, 4), frows(ds, 8)); // today's full-parallel cap
+     try std.testing.expectEqual(@as(usize, 4), frows(df, 8));
+     try std.testing.expect(fits(df, 8));
+     try std.testing.expect(!fits(df, 9)); // 72 rows: past one pass
+--- zig/src/families/glm_moe_dsa/cuda_multi.zig.bak	2026-10-16 09:37:17.031079119 +0300
++++ zig/src/families/glm_moe_dsa/cuda_multi.zig	2026-10-16 09:40:42.307201888 +0300
+@@ -16,9 +16,10 @@
+ //! ported: TF_GLM53_FILL_LAYERS (a long chunk paused between layers while others decode): a chunk here always fills
+ //! whole - the same bits, a longer stall for the decoding streams while a long prompt fills.
+ //!
+-//! Draft cut (TF_GLM53_DRAFT_CUT 0.6 from TF_GLM53_DRAFT_CUT_STREAMS 4 streams): after the MTP chain every rank
+-//! computes each stream's chain probability from the gathered pick logits and log-sum-exps (glm53_cut_stats) and
+-//! drops the drafts past the cut from the verify window before it runs. Drafts only propose: replies are the same.
++//! Draft cut (TF_GLM53_DRAFT_CUT 0.6 from TF_GLM53_DRAFT_CUT_STREAMS 4 ACTIVE streams - the round's live count, not
++//! the configured parallel): after the MTP chain every rank computes each stream's chain probability from the gathered
++//! pick logits and log-sum-exps (glm53_cut_stats) and drops the drafts past the cut from the verify window before it
++//! runs. Drafts only propose: replies are the same.
+ //!
+ //! Picks: greedy windows take the device argmax head; a window with a sampled stream takes the "local" head and each
+ //! rank's candidates (the device top-k, one gather): sampled rows draw with their stream's keyed sampling at the
+@@ -36,11 +37,12 @@
+ //!
+ //! Phase 4c: DFlash2 and DSpark streams (cuda_mdraft.zig; multi.py's DFLASH mode, and DSpark the same way): a drafter
+ //! stream's round asks its drafter for up to min(the drafter's most, the window's share - 1, its depth setting) drafts
+-//! (4 streams: 7), every drafting stream's block in one pass, each stream's host stage on its own; its window rows are
+-//! [pending, drafts] from the host; after the picks every drafter stream's kept rows' taps (vb.taps) extend its slot's
+-//! drafter context, and each prompt chunk's taps do too. From TF_GLM53_DRAFT_CUT_STREAMS streams their confidence floor
+-//! rises to TF_GLM53_DRAFT_CUT_DFLASH (default: TF_GLM53_DRAFT_CUT). Verify windows hold N x max(k + 1, the drafters'
+-//! rows) rows. A drafter stream's kept prompt state keeps its slot's ring window, and a stream resumed from it gets the
++//! (4 streams: 7) - the share ADAPTIVE, by the round's LIVE streams (a lone stream on a parallel-8 serve drafts to
++//! the drafter's most; Multi.depthOf), every drafting stream's block in one pass, each stream's host stage on its
++//! own; its window rows are [pending, drafts] from the host; after the picks every drafter stream's kept rows' taps
++//! (vb.taps) extend its slot's drafter context, and each prompt chunk's taps do too. From TF_GLM53_DRAFT_CUT_STREAMS
++//! ACTIVE streams their confidence floor rises to TF_GLM53_DRAFT_CUT_DFLASH (default: TF_GLM53_DRAFT_CUT). Verify
++//! windows hold N x max(k + 1, the drafters' rows) rows. A drafter stream's kept prompt state keeps its slot's ring window, and a stream resumed from it gets the
+ //! window in its own slot (prefixes.slot_ring_window / put_slot_ring_window). Not here: auto mode (per-stream MTP /
+ //! DFlash2 by rate), copy drafts.
+ //!
+@@ -110,10 +112,11 @@
+ 
+ /// The concurrent decoder's settings (every rank the same: they are in the boot's settings digest).
+ pub const Settings = struct {
+-    /// TF_GLM53_DRAFT_CUT (0: off) and TF_GLM53_DRAFT_CUT_STREAMS (at least 2)
++    /// TF_GLM53_DRAFT_CUT (0: off) and TF_GLM53_DRAFT_CUT_STREAMS (at least 2; from that many ACTIVE - live - streams
++    /// a round, never the configured parallel)
+     draft_cut: f64 = 0.6,
+     cut_streams: usize = 4,
+-    /// TF_GLM53_DRAFT_CUT_DFLASH: a drafter stream's confidence floor from cut_streams streams (null: draft_cut)
++    /// TF_GLM53_DRAFT_CUT_DFLASH: a drafter stream's confidence floor from cut_streams ACTIVE streams (null: draft_cut)
+     draft_cut_dflash: ?f64 = null,
+     /// TF_GLM53_BATCH_FILL / TF_GLM53_QUICK_ROWS
+     batch_fill: bool = true,
+@@ -798,13 +801,18 @@
+         return mu.md[which];
+     }
+ 
+-    /// The drafts a drafter stream may ask a round (multi._dflash_cfg's depth): the drafter's most, its window rows
+-    /// less the pending token, the settings' depth (TF_GLM53_DFLASH_DEPTH / TF_GLM53_DSPARK_DEPTH).
+-    fn depthOf(mu: *const Multi, which: usize) usize {
++    /// The drafts a drafter stream may ask a round (multi._dflash_cfg's depth): the drafter's most, the round's window
++    /// share less the pending token, the settings' depth (TF_GLM53_DSPARK_DEPTH / TF_GLM53_DFLASH_DEPTH). ADAPTIVE
++    /// FROWS: the share is by the round's LIVE streams, not the configured parallel - a lone stream on a parallel-8
++    /// serve drafts to the drafter's most (8 with block 8) where the configured share would cap it at 3, a full round
++    /// takes the configured cap. The window budget holds by construction: every live stream takes at most
++    /// max(k + 1, frows(live)) rows and live x max(k + 1, frows(live)) <= decode_rows (frows falls as live rises, and
++    /// the boot's windowRowsWith refusal pinned N x max(k + 1, frows(N)) <= decode_rows).
++    fn depthOf(mu: *const Multi, which: usize, n_live: usize) usize {
+         const x = mu.md[which] orelse return 0;
+         const b = x.base;
+         const want = if (b.sp.kind == .dspark) b.dset.depth else b.fset.depth;
+-        return @min(@min(b.sp.maxDepth(), mdraft.frows(b.sp, mu.N) - 1), want);
++        return @min(@min(b.sp.maxDepth(), mdraft.frows(b.sp, @max(n_live, 1)) - 1), want);
+     }
+ 
+     /// A drafter stream's confidence floor this round: the settings' (TF_GLM53_DFLASH_CONFIDENCE /
+@@ -1228,10 +1236,11 @@
+                 .dflash, .dspark => arm_draft,
+                 .serial => arm_none,
+             };
+-            // multi._round's room: MTP k; a drafter stream min(its depth, the tokens left - 1, the cache left - 1)
++            // multi._round's room: MTP k; a drafter stream min(its depth - ADAPTIVE, by the round's live streams - the
++            // tokens left - 1, the cache left - 1)
+             const room: usize = switch (arm) {
+                 arm_mtp => mu.k,
+-                arm_draft => @min(mu.depthOf(drafterOf(s.mode).?), @min(s.count -| s.out.items.len -| 1, mu.r.capacity -| s.P -| 1)),
++                arm_draft => @min(mu.depthOf(drafterOf(s.mode).?, n_live), @min(s.count -| s.out.items.len -| 1, mu.r.capacity -| s.P -| 1)),
+                 else => 0,
+             };
+             plan.items[plan.n] = .{ .sid = s.sid, .slot = @intCast(s.slot), .P = @intCast(s.P), .tok = s.tok, .m = @intCast(s.m), .mode = @backingInt(s.mode), .arm = arm, .room = @intCast(room), .sampled = @intFromBool(s.sampling != null) };
+@@ -1883,3 +1892,19 @@
+     set.draft_cut_dflash = 0.5;
+     try std.testing.expectEqual(@as(f64, 0.5), set.cutDFlash());
+ }
++
++test "adaptive frows: the per-round draft cap follows the round's LIVE streams and the window budget always holds" {
++    const ds: draft.Spec = .{ .kind = .dspark, .D = 6144, .hd = 64, .H = 16, .KV = 16, .I = 3072, .layers = 3, .ntaps = 5, .block = 8, .top_k = 64, .V = 38720, .vocab_off = 0, .eps = 1e-5, .window = 2048, .causal = true, .world = 8, .theta = 8e6, .mask_id = 154856 };
++    // the per-round cap (depthOf's frows term) at live streams 1..8 on a parallel-8 serve
++    const caps = [_]usize{ 8, 8, 8, 7, 5, 4, 3, 3 };
++    for (caps, 1..) |cap, live| try std.testing.expectEqual(cap, mdraft.frows(ds, live) - 1);
++    // the budget invariant: live x max(k + 1, frows(live)) <= decode_rows whenever the boot's own
++    // N x max(k + 1, frows(N)) <= decode_rows holds (the windowRowsWith refusal pins it at N)
++    for ([_]usize{ 0, 2 }) |k| {
++        for (1..9) |live| {
++            const rows = live * @max(k + 1, mdraft.frows(ds, live));
++            try std.testing.expect(rows <= fw.decode_rows);
++        }
++        try std.testing.expectEqual(8 * @max(k + 1, mdraft.frows(ds, 8)), try windowRowsWith(8, k, mdraft.frows(ds, 8)));
++    }
++}
+--- zig/src/families/glm_moe_dsa/cuda_engine.zig.bak	2026-10-16 09:37:17.032690810 +0300
++++ zig/src/families/glm_moe_dsa/cuda_engine.zig	2026-10-16 09:39:14.576978124 +0300
+@@ -564,8 +564,8 @@
+         if (o.parallel > 1) {
+             b.multi = try multi.Multi.init(gpa, io, &b.r, o.parallel, o.multi_set, o.rank == 0);
+             const per = b.multi.?.bytesPerStream();
+-            std.log.info("glm53 rank {d}: {d} concurrent streams (MTP drafts {d}, windows up to {d} rows), {d:.2} GiB of caches each ({d} tokens); draft cut {d} from {d} streams", .{ o.rank, o.parallel, o.k, b.multi.?.rows, @as(f64, @floatFromInt(per)) / (1 << 30), o.context, o.multi_set.draft_cut, o.multi_set.cut_streams });
+-            if (b.multi.?.frows > 0) std.log.info("glm53 rank {d}: concurrent drafters: DFlash2 {s}, DSpark {s}; up to {d} drafts a stream, confidence floor {d} from {d} streams; requests draft with {t}", .{ o.rank, if (b.dflash_dr != null) "on" else "off", if (b.dspark_dr != null) "on" else "off", b.multi.?.frows - 1, o.multi_set.cutDFlash(), o.multi_set.cut_streams, b.mode });
++            std.log.info("glm53 rank {d}: {d} concurrent streams (MTP drafts {d}, windows up to {d} rows), {d:.2} GiB of caches each ({d} tokens); draft cut {d} from {d} active streams", .{ o.rank, o.parallel, o.k, b.multi.?.rows, @as(f64, @floatFromInt(per)) / (1 << 30), o.context, o.multi_set.draft_cut, o.multi_set.cut_streams });
++            if (b.multi.?.frows > 0) std.log.info("glm53 rank {d}: concurrent drafters: DFlash2 {s}, DSpark {s}; up to {d} drafts a stream at {d} streams (adaptive: by the round's active streams), confidence floor {d} from {d} active streams; requests draft with {t}", .{ o.rank, if (b.dflash_dr != null) "on" else "off", if (b.dspark_dr != null) "on" else "off", b.multi.?.frows - 1, o.parallel, o.multi_set.cutDFlash(), o.multi_set.cut_streams, b.mode });
+         }
+         b.stage = 19;
+         if (o.prewarm) {
