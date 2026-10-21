@@ -8,7 +8,7 @@ benchmarked results — using the **Zig/CUDA TensorFold engine** instead of vLLM
 
 TensorFold (by [ashhart](https://github.com/ashhart/TensorFold)) is a compact LLM inference
 engine with native CUDA servers, AOT-captured kernel packs, and multi-rank tensor parallelism.
-On the 8× GB10 cluster it serves GLM-5.3 EXL3 at **2.05× the prose / 1.65× the code speed of
+On the 8× GB10 cluster it serves GLM-5.3 EXL3 at **1.6× the the speed of
 the equivalent NVFP4 vLLM serve**, with **1,000,000-token context** .
 
 ## Models index
