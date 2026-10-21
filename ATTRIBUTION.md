@@ -17,7 +17,6 @@ Spark. This project builds directly on their work:
 - The published serve image (`ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark`) —
   the runtime base of our `ghcr.io/ciprianveg/gb10-tensorfold-glm53:v1` image, which
   adds our built engine and AOT kernel pack on top
-- The DSpark **ft2 fine-tune** of the RedHatAI speculator
 - The nemotron in-tree fp8 precedent inside TensorFold
 
 Full credit to **drowzeys**. See [drowzeys/TensorFold](https://github.com/drowzeys/TensorFold)
