@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# tensorfold-serve — the gb10-tensorfold serve entry (the image's ENTRYPOINT).
+#
+# FLAGS
+#   --context N        the KV window (default 200000; the DCP1 speed tier's working form).
+#   --parallel N       the concurrent slots (default 1; 2 = the C2 speed tier).
+#   --drafts on|off    the DSpark drafter (default on: confidence policy). OFF is a different
+#                      numeric lane — do not expect the same texts.
+#   --dcp 1|2          the decode-context-parallel mode (default 1).
+#   --kv8-v3 on|off    the 656B KV rows (default ON).
+#   --graphs on|off    the decode graphs (default ON — eager is measurably slower).
+#   --port N           the HTTP port (default 5001; OpenAI-compatible /v1 + /generate + /health).
+#
+# The first positional argument is the model pack path (default
+# /home/ciprian/models/models11/GLM-5.3-NVFP4-CSF) — mount the models share at boot.
+# With drafts on, the DSpark drafter pack must be mounted at /dspark (read-only).
+#
+# CLUSTER ENVS (set by start.sh; documented defaults):
+#   TF_GLM53_RANK / TF_GLM53_WORLD / TF_GLM53_MASTER  — the rank, the world size, the rendezvous.
+#   TF_GLM53_HCAS / TF_GLM53_GID                      — the RoCE device and broadcast GID.
+#   ROCE_PROXY_CPU                                    — the RoCE relay thread's CPU pin.
+#
+# BOOT-FAILURE FAST PATH: a boot that hangs past the load is usually a rank that never
+# came up — check `docker ps -a` on every peer first, then grep REFUSED the launcher
+# log and the rank logs. Re-fire only after the fleet is fully down.
+set -euo pipefail
+
+CONTEXT=200000
+PARALLEL=1
+DRAFTS=on
+DCP=1
+KV8_V3=on
+GRAPHS=on
+PORT=5001
+PACK=/home/ciprian/models/models11/GLM-5.3-NVFP4-CSF
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --context) CONTEXT="$2"; shift 2;;
+    --parallel) PARALLEL="$2"; shift 2;;
+    --drafts) DRAFTS="$2"; shift 2;;
+    --dcp) DCP="$2"; shift 2;;
+    --kv8-v3) KV8_V3="$2"; shift 2;;
+    --graphs) GRAPHS="$2"; shift 2;;
+    --port) PORT="$2"; shift 2;;
+    *) PACK="$1"; shift;;
+  esac
+done
+
+onoff() { case "$1" in on) echo 1;; off) echo 0;; *) echo "REFUSED: $2 must be on|off" >&2; exit 2;; esac; }
+
+export TF_GLM53_KV8=1
+export TF_GLM53_KV8_V3=$(onoff "$KV8_V3" --kv8-v3)
+export TF_GLM53_DCP="$DCP"
+export TF_GLM53_PROMPT_SP=1
+export TF_GLM53_GRAPHS=$(onoff "$GRAPHS" --graphs)
+export TF_GLM53_PREWARM=1
+export TF_GLM53_K=0
+export TF_GLM53_PARALLEL="$PARALLEL"
+if [ "$DRAFTS" = on ]; then
+  export TF_GLM53_DSPARK=/dspark
+  export TF_GLM53_DSPARK_POLICY=confidence
+  export TF_GLM53_DSPARK_CONFIDENCE="${TF_GLM53_DSPARK_CONFIDENCE:-0.30}"
+fi
+
+exec /usr/local/bin/tensorfold-native serve "$PACK" "$PORT" "$CONTEXT"
