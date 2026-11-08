@@ -129,6 +129,33 @@ lives at the upstream repo (`asHHart/TensorFold`); nothing in this product
 depends on it. This repo serves the GLM-5.3 **NVFP4-CSF** pack on the GB10
 fleet, full stop.
 
+## The engine work (beyond the TensorFold base)
+
+The major contributions this repo adds on top of TensorFold 1.2.1 —
+none of it exists upstream; every other delta is listed one line at a
+time in `PATCHES.md`:
+
+- **The glm53r2 native CUDA family** — the NVFP4-CSF pack loader, MLA/DSA
+  latent attention, the sparse indexer, the KDA linear-attention layers:
+  the native serving path for GLM-5.3.
+- **DCP (decode-context-parallel) 1 and 2** — the decode-time KV plane
+  forms: DCP1 the un-split plane (fastest), DCP2 the split plane (the
+  maximum-capacity form).
+- **The shared-KV pool** — max-not-division: requests claim what they
+  need (first-fit, evict-oldest-idle, an honest over-cap refusal at the
+  API); mixed-length streams share one aggregate (600K at DCP1/P4,
+  1.2M at DCP2).
+- **KV8 v3** — the 656B KV rows: exact-bf16 rope plus the latent scale
+  block.
+- **DSpark** — the adaptive speculative drafter (confidence policy,
+  conf 0.20, depth 8).
+- **The fp8-e4m3 dense lane** — the four attention projections at
+  128-block quantized-compute.
+- **Resume/tail-recompute** — grown conversations resume without
+  re-reading: 297K-token turns in ~4-5.6 s (was a 344 s re-read).
+- The prompt cache + reuse, the AOT compile lane with the copack, and
+  the RoCE fabric health checks.
+
 ## Settings (the knobs, their defaults, and why)
 
 `start.sh` pins these; every one is env-overridable. The defaults are the
