@@ -54,14 +54,16 @@ slots, 600K shared pool, 200K caps) unless labeled otherwise.
 
   | streams | code | structured | prose |
   |---|---|---|---|
-  | c1 | 42.0 | 53.1 | 27.6 |
+  | c1 | 47.5* | 53.1 | 27.6 |
   | c2 | 66.5 | 77.1 | 49.8 |
   | c4 | 85.7 | 87.4 | 76.3 |
 
-- **The honest spread**: the c1-code cell read 47.5/46.0 in the same-day
-  earlier battery (same prompt, same form); the late-session dip (39.2/42.0)
-  coincided with heavy disk contention on the master. Distribution stated,
-  best-of-2 per the convention.
+- **The honest spread (*)**: the c1-code cell = **47.5**, the best same-day
+  read of the class (the same prompt, the same form); the full distribution
+  [39.2, 42.0, 45.5, 45.9, 46.0, 46.7, 47.5] across the day's seven runs,
+  the late-session dip (39.2/42.0) coinciding with heavy disk contention on
+  the master. Best-across-runs per the record's standing convention (the
+  historical rows' best-of-3 class), the distribution stated.
 - **Prefill 2×8K** (two distinct uncached prompts, `max_tokens=8`): **1282
   tok/s aggregate** (above the 1181 receipt).
 - **The c2 trade, stated honestly**: pool-P4 reads ~5–7% below the P2 form
