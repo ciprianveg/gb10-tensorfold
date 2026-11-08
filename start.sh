@@ -73,6 +73,10 @@ for n in $NODES; do
     ssh -o BatchMode=yes -o ConnectTimeout=15 "$n" 'docker load' \
       < <(ssh -o BatchMode=yes -o ConnectTimeout=15 "$MASTER" "docker save $IMAGE") \
       || { echo "REFUSED: $n image restore failed"; exit 13; }
+    # docker load renames a superseded same-tag image to <none> — prune the orphan,
+    # or every image update leaks a 25.5 GB layer set per node.
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "$n" \
+      'docker images --filter dangling=true --format "{{.ID}}" | xargs -r docker rmi >/dev/null 2>&1; true'
   fi
 done
 echo "image gate: $IMAGE $want uniform on all $WORLD nodes"

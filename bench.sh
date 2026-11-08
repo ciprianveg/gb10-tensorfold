@@ -6,6 +6,8 @@
 # Three checks, in order:
 #   1. /health          — the serve answers.
 #   2. the speed probe  — a 1500-token single-HTML Snake game, greedy; reports tok/s.
+#                         The FIRST read on a fresh boot is cold (the graphs' first replay
+#                         pays the warmup) — expect the second read noticeably faster.
 #                         The speed tier's receipted class is ~44-49 tok/s (DCP1, 200K window);
 #                         other tiers/contexts read lower — this is a sanity read, not a benchmark.
 #   3. the determinism spot-check — the same Snake prompt and a fixed prose prompt, twice each:
