@@ -93,11 +93,17 @@ bash start.sh stop           # the clean fleet teardown
 Decode, aggregate across concurrent streams (512-token generations,
 2 runs a cell, best reported; per-stream in the record):
 
-| streams | code | structured | prose |
+| streams | code | JSON-output* | prose |
 |---|---|---|---|
 | c1 | 47.5 | 53.1 | 27.6 |
 | c2 | 66.5 | 77.1 | 49.8 |
 | c4 | 85.7 | 87.4 | 76.3 |
+
+\* **JSON-output, not JSON-constrained**: these are free-form generations
+prompted to produce JSON — no grammar, no schema enforcement. The
+grammar-constrained structured-output path is parked (unverified;
+`response_format` is unsupported) and contributes nothing to these
+numbers.
 
 The Snake-1500 probe (the record's own class): **49.0 tok/s**. Prefill,
 two distinct uncached ~8K prompts at once: **1282 tok/s** aggregate.

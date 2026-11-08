@@ -56,12 +56,16 @@ link-bound stage; decode at these depths is link-insensitive).
 - **The concurrency matrix at pool-P4** (512-token generations, greedy, 2 runs
   per cell, the best reported per the convention):
 
-  | streams | code | structured | prose |
+  | streams | code | JSON-output* | prose |
   |---|---|---|---|
   | c1 | 47.5* | 53.1 | 27.6 |
   | c2 | 66.5 | 77.1 | 49.8 |
   | c4 | 85.7 | 87.4 | 76.3 |
 
+- ***JSON-output, not JSON-constrained*: the JSON column is free-form
+  generation prompted to produce JSON (no grammar, no schema
+  enforcement); the grammar-constrained path is parked and contributes
+  nothing to these numbers.
 - ***: the c1-code class read **44–49 tok/s** across the day's clean runs
   (this form, this prompt); two late-session reads (39.2/42.0) fell under
   heavy disk contention on the master and are excluded from the range. The
