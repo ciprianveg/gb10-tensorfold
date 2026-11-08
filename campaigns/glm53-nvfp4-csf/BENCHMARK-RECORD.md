@@ -46,9 +46,9 @@ rows would fit in sum; the ordered submit (the large claim first) packs the same
 All rows same-day 2026-11-08, greedy temperature 0, the pool-P4 form (DCP1, 4
 slots, 600K shared pool, 200K caps) unless labeled otherwise. **The ranks
 were connected at 100 Gb/s (one CX7 rail) for every row below; at 200 Gb/s
-(both rails) prefill measures ~30% higher** (the user's receipt — the
-prompt-pass all-gather is the link-bound stage; decode at these depths is
-link-insensitive).
+(both rails) prefill measures ~30% higher — 1600 tok/s at the 2×8K
+class** (the user's receipt — the prompt-pass all-gather is the
+link-bound stage; decode at these depths is link-insensitive).
 
 - **Snake-1500: 49.0 tok/s** (greedy, `/v1/completions`, the record's probe
   class — the 1500-token single-HTML Snake game; same-day reads 48.4–49.2

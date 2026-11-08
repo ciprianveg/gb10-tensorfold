@@ -106,7 +106,8 @@ Replies are deterministic at greedy (byte-identical repeats), and
 
 **Link speed**: these rows were measured with the ranks connected at
 **100 Gb/s** (one CX7 rail). At **200 Gb/s** (both rails) prefill runs
-**~30% higher**; decode is link-insensitive at these depths.
+**~30% higher — 1600 tok/s** at the same 2×8K class; decode is
+link-insensitive at these depths.
 
 **The pool, concretely**: the fleet holds 600K tokens of KV at once,
 claimed as streams need — one 400K conversation beside a 100K and a 90K,
