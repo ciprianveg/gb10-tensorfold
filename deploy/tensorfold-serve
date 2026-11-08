@@ -60,7 +60,7 @@ export TF_GLM53_PARALLEL="$PARALLEL"
 if [ "$DRAFTS" = on ]; then
   export TF_GLM53_DSPARK=/dspark
   export TF_GLM53_DSPARK_POLICY=confidence
-  export TF_GLM53_DSPARK_CONFIDENCE="${TF_GLM53_DSPARK_CONFIDENCE:-0.30}"
+  export TF_GLM53_DSPARK_CONFIDENCE="${TF_GLM53_DSPARK_CONFIDENCE:-0.20}"
 fi
 
 exec /usr/local/bin/tensorfold-native serve "$PACK" "$PORT" "$CONTEXT"

@@ -53,6 +53,67 @@ bash start.sh stop        # the clean fleet teardown
 Measured receipts for the `speed` tier and the deep-context quality gates
 live in `campaigns/glm53-nvfp4-csf/BENCHMARK-RECORD.md`.
 
+## Settings (the knobs, their defaults, and why)
+
+`start.sh` pins these; every one is env-overridable. The defaults are the
+receipted production configuration — change one only with a reason.
+
+| Knob | Default | Why |
+|---|---|---|
+| `DCP` | 1 (`speed`), 2 (`capacity`) | decode-context-parallel mode; DCP1 = the un-split KV plane (fastest tiers), DCP2 = the split plane (4 uniform slots) |
+| `PARALLEL` | 2 (`speed`), 4 (pool/capacity) | concurrent request slots |
+| `CONTEXT` | 200000 (`speed`) | the KV window per slot |
+| `POOL_AGG` | 600000 (`pool-600k`) | the shared KV pool aggregate — requests claim what they need, not a pre-division |
+| `MIN_BUCKET` | 0; 262144 in `pool-600k` | the decode-graph capture's bucket floor; the deep-context capture bound |
+| `TF_GLM53_DSPARK_CONFIDENCE` | 0.20 | the drafter's confidence floor — the receipted accept-rate/yield balance |
+| `TF_GLM53_DSPARK_DEPTH` | 8 | the drafter's max depth — the sweep's winner (depth-8 with the MTP layers off) |
+| `TF_GLM53_DSPARK_POLICY` | confidence | drafts accepted by per-token confidence |
+| `TF_GLM53_K` | 0 | the MTP layers stay off — the dspark drafter owns speculation (K-layers were sha-identical, pure load) |
+| `TF_GLM53_KV8_V3` | 1 | the 656B KV rows (the exact-bf16 rope + the latent block) |
+| `TF_GLM53_GRAPHS` | 1 | captured decode graphs — eager is measurably slower |
+| `TF_GLM53_PREWARM` | 1 | the graph capture runs at boot, not on first request |
+| `TF_GLM53_GRAPH_MAX_ROWS` | 8 | the captured verify-window rows |
+| `TF_GLM53_PREWARM_MB_GRAPH` | 20 | the prewarm's memory budget for capture |
+| `TENSORFOLD_MEMORY_RESERVE_GIB` | 8 | the engine's reserve: the prewarm floor + the measured variance band |
+| `TF_GLM53_PREWARM_END_FREE_GB` | 6 | the prewarm stops with this much free — the deep-form fit floor |
+| `TF_GLM53_CACHE_GIB` | 4 | the prompt-reuse cache plane (multi-turn prefix reuse) |
+| `TF_GLM53_PROMPT_REUSE` | 1 | the multi-turn cache on |
+| `TF_GLM53_PROMPT_ROWS` / `_SHORT` | 4096 / 4096 | the prompt chunk rows |
+| reasoning `effort` | `none` | the request-side reasoning-effort default; `none minimal low medium high xhigh max` all accepted, anything else is a clean 400 |
+| `TF_GLM53_ROCE` / `HCAS` / `GID` | 1 / `rocep1s0f1` / 3 | the RoCE fabric wiring — adjust to your fabric |
+
+## Known issues and limitations (honest, per the receipts)
+
+- **Structured output is not enforced yet.** `response_format` is unsupported
+  and `tool_choice: "required"`/named returns a clean 400 — the token-grammar
+  lane is built but parked pending one mid-round collective. Agent clients
+  must use `tool_choice: auto` with tightly-typed tool schemas; the model
+  calls tools when appropriate and emits well-formed call JSON, but nothing
+  constrains the output tokens yet.
+- **Multi-turn resume trades small-turn latency for correctness.** A grown
+  conversation re-computes the tail of the kept context at the resume (the
+  exact-bits form); big turns get fast resume, small turns pay a visible
+  latency price. The trade was ruled in favor of score and determinism.
+- **Prose generation is entropy-bound around ~22-25 tok/s.** Not a defect:
+  the drafter, the KV form, and the graph lane were each tested and
+  exonerated; low-entropy prose simply accepts fewer drafts than code.
+  Code generation reads ~2x prose.
+- **Four uniform slots do not fit at DCP1.** The un-split plane's memory
+  ceiling refuses 4 uniform DCP1 slots; use the `pool-600k` arm (requests
+  claim what they need) or the DCP2 `capacity` arm for 4-stream serving.
+
+## How the numbers were measured
+
+Every row in `BENCHMARK-RECORD.md` carries its class (what was generated),
+denominator (how many requests/streams/runs), and distribution (the spread
+across runs). All speed and quality rows are **greedy, temperature 0**,
+single-prompt classes unless stated: the code rows are 1500-token
+single-HTML Snake games, the prose rows 1024-token stories, the concurrency
+rows are N identical code streams started together. Determinism is a gate,
+not a hope: the same prompt at greedy must be byte-identical across runs
+and across concurrent-vs-sequential — `bench.sh` spot-checks exactly this
+on every deploy, and the campaign's receipts held it across binaries.
+
 ## Notes that save hours
 
 - **The AOT pack must exist on every node before boot** — `start.sh` checks;
