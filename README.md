@@ -12,6 +12,17 @@ nodes — one image, one launcher, one verification script.
 > that is the whole verify. (A rebuild, if ever needed, is the
 > `docker build` in `BUILD.md`, run on the GB10 host when free; the
 > build-context binaries and their lane are documented there.)
+>
+> **Validation, as it stands.** Verified without the fleet: the registry
+> manifests (all three tags resolve); the fresh-clone hygiene (no keys,
+> no stray benchmark classes in the product files); the baked entry
+> wrapper (the drafter pins and the exec line as documented). **Deferred
+> — the serve-adjacent live runs only**: `start.sh`'s fleet boot and
+> `bench.sh`'s probes (health, tok/s, determinism) need the cluster
+> free; they are the user's one command away and are the only unverified
+> claims in this repo. Every number quoted in the README and the
+> benchmark record was measured on the running fleet — none was taken
+> from this packaging window.
 
 The engine is **TensorFold** (Ash Hart's upstream framework — the DSA
 attention, the DCP cache planes, the draft/verify speculative spine this
