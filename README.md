@@ -131,9 +131,8 @@ fleet, full stop.
 
 ## The engine work (beyond the TensorFold base)
 
-The major contributions this repo adds on top of TensorFold 1.2.1 —
-none of it exists upstream; every other delta is listed one line at a
-time in `PATCHES.md`:
+The engine work this repo adds on top of TensorFold 1.2.1; every other
+delta is listed one line at a time in `PATCHES.md`:
 
 - **The glm53r2 native CUDA family** — the NVFP4-CSF pack loader, MLA/DSA
   latent attention, the sparse indexer, the KDA linear-attention layers:
