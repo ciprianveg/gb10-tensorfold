@@ -62,13 +62,16 @@ given (default 5901).
 ## The forms
 
 The default is the **pool-P4 form**: DCP1, 4 concurrent slots, a 600K shared
-KV pool (200K a request's cap), the 262144 graph bucket floor. **The pool is
-the behavior**: mixed-length streams, first-fit claims, evict-oldest-idle,
-and an honest over-cap refusal at the API — the serve stays alive. The
-knobs, env-overridable at the `start.sh` invocation: `PARALLEL` (slots),
-`POOL_AGG` (the pool's aggregate; set it **empty** for the uniform
-pre-division path — the slots divide the window evenly, no pool), and
-`CONTEXT` (a request's cap).
+KV pool, the 262144 graph bucket floor. **The pool is the behavior**: mixed-
+length streams, first-fit claims, evict-oldest-idle, and an honest over-cap
+refusal at the API — the serve stays alive. **The capacity is the pool
+total** (600K aggregate): what the fleet can hold at once, claimed as the
+streams actually need. `CONTEXT` (200K by default) is a single request's
+claim bound — raise it toward `POOL_AGG` and one deep stream can claim the
+whole pool. The knobs, env-overridable at the `start.sh` invocation:
+`PARALLEL` (slots), `POOL_AGG` (the pool's aggregate; set it **empty** for
+the uniform pre-division path — the slots divide the window evenly, no
+pool), and `CONTEXT` (a request's claim bound).
 
 | Form | Shape | Use |
 |---|---|---|
@@ -85,8 +88,16 @@ bash start.sh capacity       # the DCP2 split form
 bash start.sh stop           # the clean fleet teardown
 ```
 
-Measured receipts for the `speed` tier and the deep-context quality gates
+Measured receipts for both forms and the deep-context quality gates
 live in `campaigns/glm53-nvfp4-csf/BENCHMARK-RECORD.md`.
+
+**About `docs/`**: that tree is the upstream TensorFold framework's
+documentation, kept for provenance (PATCHES.md maps every delta from it).
+Its EXL3 / EXLR8 GLM-5.3 recipes describe the *framework's* serving of
+other weight formats on other hardware (two-Mac EXLR8, the Flash TR3
+checkpoints) — **not this product**. This repo serves the GLM-5.3
+**NVFP4-CSF** pack on the GB10 fleet; the NVFP4 path is the only one the
+image, `start.sh`, and the receipts below describe.
 
 ## Settings (the knobs, their defaults, and why)
 
@@ -95,11 +106,11 @@ receipted production configuration — change one only with a reason.
 
 | Knob | Default | Why |
 |---|---|---|
-| `DCP` | 1 (`speed`), 2 (`capacity`) | decode-context-parallel mode; DCP1 = the un-split KV plane (fastest tiers), DCP2 = the split plane (4 uniform slots) |
-| `PARALLEL` | 2 (`speed`), 4 (pool/capacity) | concurrent request slots |
-| `CONTEXT` | 200000 (`speed`) | the KV window per slot |
-| `POOL_AGG` | 600000 (`pool-600k`) | the shared KV pool aggregate — requests claim what they need, not a pre-division |
-| `MIN_BUCKET` | 0; 262144 in `pool-600k` | the decode-graph capture's bucket floor; the deep-context capture bound |
+| `DCP` | 1 (`pool`), 2 (`capacity`) | decode-context-parallel mode; DCP1 = the un-split KV plane (the pool form), DCP2 = the split plane (4 uniform slots) |
+| `PARALLEL` | 4 | concurrent request slots |
+| `CONTEXT` | 200000 | a single request's claim bound (the pool admits claims up to `POOL_AGG`; raise `CONTEXT` for deep single streams) |
+| `POOL_AGG` | 600000 (`pool`), unset (`capacity`) | the shared KV pool's aggregate — the fleet's total KV capacity, claimed as needed, not a pre-division |
+| `MIN_BUCKET` | 262144 (`pool`), unset (`capacity`) | the decode-graph capture's bucket floor; the deep-context capture bound (the pool pins and the P4 form go together) |
 | `TF_GLM53_DSPARK_CONFIDENCE` | 0.20 | the drafter's confidence floor — the receipted accept-rate/yield balance |
 | `TF_GLM53_DSPARK_DEPTH` | 8 | the drafter's max depth — the sweep's winner (depth-8 with the MTP layers off) |
 | `TF_GLM53_DSPARK_POLICY` | confidence | drafts accepted by per-token confidence |
