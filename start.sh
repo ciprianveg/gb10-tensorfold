@@ -78,6 +78,12 @@ done
 echo "image gate: $IMAGE $want uniform on all $WORLD nodes"
 
 # --- the boot: one detached container per node ------------------------------------------------
+# The stale-container clean first (the golden's clean_ranks class): a prior boot's dead or live
+# containers own the serve-r names — without the clean the run dies on the name conflict.
+for n in $NODES; do
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$n" 'docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1; true'
+done
+
 idx=0
 for n in $NODES; do
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$n" "docker run -d --name serve-r$idx --gpus all --network host --shm-size=2g \

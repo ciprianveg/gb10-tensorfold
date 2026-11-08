@@ -139,6 +139,11 @@ on every deploy, and the campaign's receipts held it across binaries.
 
 ## Notes that save hours
 
+- **The first deploy on a fresh fleet pays the image distribution** — about
+  13 minutes end to end: `start.sh`'s image gate streams the 25.5 GB image
+  from the master to each worker sequentially, then boots. This is a
+  once-per-node cost (the image persists); subsequent boots skip straight
+  to the launch.
 - **The AOT pack must exist on every node before boot** — `start.sh` checks;
   a missing pack mounts as an empty directory and fails ~10 minutes in,
   far from the cause.
