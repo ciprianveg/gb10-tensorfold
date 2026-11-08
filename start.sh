@@ -8,7 +8,7 @@
 #                                      #   a 600K shared KV pool (200K a request's cap),
 #                                      #   the 262144 graph bucket floor
 #   bash start.sh pool                 #   same, explicit
-#   bash start.sh capacity             #   the DCP2 4-slot split form (200K x 4, no pool)
+#   bash start.sh capacity             #   the DCP2 4-slot split form (300K x 4 = 1.2M total, no pool)
 #   bash start.sh stop                 #   the clean fleet teardown
 #
 # THE POOL IS THE BEHAVIOR: mixed-length streams, first-fit claims, evict-oldest-idle,
