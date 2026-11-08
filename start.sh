@@ -45,7 +45,7 @@ ARM=${1:-pool}
 # The forms: the pool-P4 default (the measured form), the DCP2 capacity split, the teardown.
 # ${VAR-default} (unset-only) so an EMPTY env var is a meaningful override (POOL_AGG= = no pool).
 case "$ARM" in
-  pool)      DCP=1 PARALLEL=${PARALLEL-4} CONTEXT=${CONTEXT-200000} POOL_AGG=${POOL_AGG-600000} MIN_BUCKET=${MIN_BUCKET-262144};;
+  pool)      DCP=1 PARALLEL=${PARALLEL-4} CONTEXT=${CONTEXT-400000} POOL_AGG=${POOL_AGG-600000} MIN_BUCKET=${MIN_BUCKET-262144};;
   capacity)  DCP=2 PARALLEL=${PARALLEL-4} CONTEXT=${CONTEXT-450000} POOL_AGG=${POOL_AGG-1200000} MIN_BUCKET=${MIN_BUCKET-262144};;
   stop)
     for n in $NODES; do

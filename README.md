@@ -48,7 +48,7 @@ docker pull ghcr.io/ciprianveg/gb10-tensorfold:latest
 # what's inside the image: PATCHES.md (the upstream base, every code
 # delta from it, the layer manifest — read it before the first boot)
 
-bash start.sh            # THE DEFAULT: the pool-P4 form — DCP1, 4 slots, a 600K shared KV pool
+bash start.sh            # THE DEFAULT: the pool-P4 form — DCP1, 4 slots, a 600K shared KV pool, 400K a stream's max
 # ... the boot takes ~10-20 minutes (the model load dominates; watch:
 #   ssh <master> 'docker logs serve-r0 2>&1 | grep -E "SERVE up|BIND|error" | tail'
 
@@ -62,11 +62,11 @@ given (default 5901).
 ## The forms
 
 The default is the **pool-P4 form**: DCP1, 4 concurrent slots, a 600K shared
-KV pool, the 262144 graph bucket floor. **The pool is the behavior**: mixed-
+KV pool (400K a stream's max context), the 262144 graph bucket floor. **The pool is the behavior**: mixed-
 length streams, first-fit claims, evict-oldest-idle, and an honest over-cap
 refusal at the API — the serve stays alive. **The capacity is the pool
 total** (600K aggregate): what the fleet can hold at once, claimed as the
-streams actually need. `CONTEXT` (200K by default) is a single request's
+streams actually need. `CONTEXT` (400K by default) is a single request's
 claim bound — raise it toward `POOL_AGG` and one deep stream can claim the
 whole pool. The knobs, env-overridable at the `start.sh` invocation:
 `PARALLEL` (slots), `POOL_AGG` (the pool's aggregate; set it **empty** for
@@ -75,7 +75,7 @@ pool), and `CONTEXT` (a request's claim bound).
 
 | Form | Shape | Use |
 |---|---|---|
-| `pool` (default) | DCP1, 4 slots, 600K shared pool | the measured best today: 4 concurrent streams with per-request claims — c4 85.7/87.4/76.3 (code/structured/prose) |
+| `pool` (default) | DCP1, 4 slots, 600K shared pool, 400K a stream's max | the measured best today: 4 concurrent streams with per-request claims — c4 85.7/87.4/76.3 (code/structured/prose) |
 | `capacity` | DCP2, 4 slots — **1.2M total KV pool, 450K a stream's max context** | the split-plane form: the maximum-capacity pool — four streams claiming from 1.2M, each up to 450K deep |
 
 **The pool pins and the P4 form go together**: plain DCP1/P4 *without* the
@@ -108,7 +108,7 @@ receipted production configuration — change one only with a reason.
 |---|---|---|
 | `DCP` | 1 (`pool`), 2 (`capacity`) | decode-context-parallel mode; DCP1 = the un-split KV plane (the pool form), DCP2 = the split plane (4 uniform slots) |
 | `PARALLEL` | 4 | concurrent request slots |
-| `CONTEXT` | 200000 | a single request's claim bound (the pool admits claims up to `POOL_AGG`; raise `CONTEXT` for deep single streams) |
+| `CONTEXT` | 400000 (`pool`), 450000 (`capacity`) | a single request's claim bound (the pool admits claims up to `POOL_AGG`; raise `CONTEXT` for deep single streams) |
 | `POOL_AGG` | 600000 (`pool`), unset (`capacity`) | the shared KV pool's aggregate — the fleet's total KV capacity, claimed as needed, not a pre-division |
 | `MIN_BUCKET` | 262144 (`pool`), unset (`capacity`) | the decode-graph capture's bucket floor; the deep-context capture bound (the pool pins and the P4 form go together) |
 | `TF_GLM53_DSPARK_CONFIDENCE` | 0.20 | the drafter's confidence floor — the receipted accept-rate/yield balance |
