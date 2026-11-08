@@ -24,6 +24,8 @@ design and the dense/head quantization patterns are **Mia**'s. See
 ```bash
 # on the master node (the first of your node list):
 docker pull ghcr.io/ciprianveg/gb10-tensorfold:latest
+# what's inside the image: PATCHES.md (the upstream base, every code
+# delta from it, the layer manifest — read it before the first boot)
 
 bash start.sh            # the speed tier: DCP1, 2 slots, 200K context
 # ... the boot takes ~10-20 minutes (the model load dominates; watch:
