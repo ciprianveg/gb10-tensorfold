@@ -88,8 +88,30 @@ bash start.sh capacity       # the DCP2 maximum-capacity form: the 1.2M pool
 bash start.sh stop           # the clean fleet teardown
 ```
 
-Measured receipts for both forms and the deep-context quality gates
-live in `campaigns/glm53-nvfp4-csf/BENCHMARK-RECORD.md`.
+## Performance (the pool-P4 form, same-day 2026-11-08, greedy)
+
+Decode, aggregate across concurrent streams (512-token generations,
+2 runs a cell, best reported; per-stream in the record):
+
+| streams | code | structured | prose |
+|---|---|---|---|
+| c1 | 47.5 | 53.1 | 27.6 |
+| c2 | 66.5 | 77.1 | 49.8 |
+| c4 | 85.7 | 87.4 | 76.3 |
+
+The Snake-1500 probe (the record's own class): **49.0 tok/s**. Prefill,
+two distinct uncached ~8K prompts at once: **1282 tok/s** aggregate.
+Replies are deterministic at greedy (byte-identical repeats), and
+4-at-once equals 1-at-a-time on the same requests.
+
+**The pool, concretely**: the fleet holds 600K tokens of KV at once,
+claimed as streams need — one 400K conversation beside a 100K and a 90K,
+or four growing together; a claim the pool cannot place yet is refused
+honestly at the API and the serve stays alive.
+
+Full rows — class, denominator, distribution, both forms, the quality
+gates (the 128K-depth needle, the anchor sets) — in
+[`campaigns/glm53-nvfp4-csf/BENCHMARK-RECORD.md`](campaigns/glm53-nvfp4-csf/BENCHMARK-RECORD.md).
 
 **This repo carries only the product's docs**: this README (the quickstart,
 the forms, the settings, the known issues), **the benchmark record**
