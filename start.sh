@@ -46,7 +46,7 @@ ARM=${1:-pool}
 # ${VAR-default} (unset-only) so an EMPTY env var is a meaningful override (POOL_AGG= = no pool).
 case "$ARM" in
   pool)      DCP=1 PARALLEL=${PARALLEL-4} CONTEXT=${CONTEXT-200000} POOL_AGG=${POOL_AGG-600000} MIN_BUCKET=${MIN_BUCKET-262144};;
-  capacity)  DCP=2 PARALLEL=${PARALLEL-4} CONTEXT=${CONTEXT-200000} POOL_AGG= MIN_BUCKET=;;
+  capacity)  DCP=2 PARALLEL=${PARALLEL-4} CONTEXT=${CONTEXT-300000} POOL_AGG= MIN_BUCKET=;;
   stop)
     for n in $NODES; do
       ssh -o BatchMode=yes -o ConnectTimeout=10 "$n" \

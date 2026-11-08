@@ -76,7 +76,7 @@ pool), and `CONTEXT` (a request's claim bound).
 | Form | Shape | Use |
 |---|---|---|
 | `pool` (default) | DCP1, 4 slots, 600K shared pool | the measured best today: 4 concurrent streams with per-request claims — c4 85.7/87.4/76.3 (code/structured/prose) |
-| `capacity` | DCP2, 4 uniform slots, 200K each | the split-plane form — 4 uniform slots, no pool |
+| `capacity` | DCP2, 4 uniform slots, 300K each — **1.2M total KV** | the split-plane form — 4 uniform slots, no pool, the maximum uniform capacity |
 
 **The pool pins and the P4 form go together**: plain DCP1/P4 *without* the
 pool refuses at the prewarm budget (139 graphs, 8.7 GiB needed vs 6.7 free —
