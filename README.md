@@ -104,6 +104,10 @@ two distinct uncached ~8K prompts at once: **1282 tok/s** aggregate.
 Replies are deterministic at greedy (byte-identical repeats), and
 4-at-once equals 1-at-a-time on the same requests.
 
+**Link speed**: these rows were measured with the ranks connected at
+**100 Gb/s** (one CX7 rail). At **200 Gb/s** (both rails) prefill runs
+**~30% higher**; decode is link-insensitive at these depths.
+
 **The pool, concretely**: the fleet holds 600K tokens of KV at once,
 claimed as streams need — one 400K conversation beside a 100K and a 90K,
 or four growing together; a claim the pool cannot place yet is refused
