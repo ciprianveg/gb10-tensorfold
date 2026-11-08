@@ -138,13 +138,15 @@ time in `PATCHES.md`:
 - **The glm53r2 native CUDA family** — the NVFP4-CSF pack loader, MLA/DSA
   latent attention, the sparse indexer, the KDA linear-attention layers:
   the native serving path for GLM-5.3.
-- **DCP (decode-context-parallel) 1 and 2** — the decode-time KV plane
-  forms: DCP1 the un-split plane (fastest), DCP2 the split plane (the
-  maximum-capacity form).
-- **The shared-KV pool** — max-not-division: requests claim what they
-  need (first-fit, evict-oldest-idle, an honest over-cap refusal at the
-  API); mixed-length streams share one aggregate (600K at DCP1/P4,
-  1.2M at DCP2).
+- **DCP2 (decode-context-parallel 2)** — the decode-time split-plane KV
+  form, the maximum-capacity mode (DCP1, the un-split plane, predates
+  this work).
+
+The **shared-KV pool** — max-not-division: requests claim what they
+need (first-fit, evict-oldest-idle, an honest over-cap refusal at the
+API); mixed-length streams share one aggregate (600K at DCP1/P4, 1.2M
+at DCP2) — is **Mia's design** (see the credits), implemented here for
+the glm53r2 engine.
 - **KV8 v3** — the 656B KV rows: exact-bf16 rope plus the latent scale
   block.
 - **DSpark** — the adaptive speculative drafter (confidence policy,
