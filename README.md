@@ -3,6 +3,16 @@
 TensorFold serving GLM-5.3 (NVFP4) on a fleet of NVIDIA DGX Spark (GB10)
 nodes — one image, one launcher, one verification script.
 
+> **Status (2026-11-08).** The image is published and the registry
+> manifests verified (`v1.0.0` / `latest`; digests in `PATCHES.md`). The
+> one remaining deploy step — the fleet smoke test (`start.sh` +
+> `bench.sh` on the nodes) — is **deferred while the cluster is in use
+> for other tasks**; nothing below needs it to be true. When the cluster
+> frees: `docker pull` on the master, `bash start.sh`, `bash bench.sh` —
+> that is the whole verify. (A rebuild, if ever needed, is the
+> `docker build` in `BUILD.md`, run on the GB10 host when free; the
+> build-context binaries and their lane are documented there.)
+
 The engine is **TensorFold** (Ash Hart's upstream framework — the DSA
 attention, the DCP cache planes, the draft/verify speculative spine this
 repo's tree carries, plus this campaign's pool plane). The pool-semantics
