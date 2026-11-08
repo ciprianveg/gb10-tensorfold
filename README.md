@@ -91,13 +91,16 @@ bash start.sh stop           # the clean fleet teardown
 Measured receipts for both forms and the deep-context quality gates
 live in `campaigns/glm53-nvfp4-csf/BENCHMARK-RECORD.md`.
 
-**About `docs/`**: that tree is the upstream TensorFold framework's
-documentation, kept for provenance (PATCHES.md maps every delta from it).
-Its EXL3 / EXLR8 GLM-5.3 recipes describe the *framework's* serving of
-other weight formats on other hardware (two-Mac EXLR8, the Flash TR3
-checkpoints) — **not this product**. This repo serves the GLM-5.3
-**NVFP4-CSF** pack on the GB10 fleet; the NVFP4 path is the only one the
-image, `start.sh`, and the receipts below describe.
+**This repo carries only the product's docs**: this README (the quickstart,
+the forms, the settings, the known issues), **the benchmark record**
+([`campaigns/glm53-nvfp4-csf/BENCHMARK-RECORD.md`](campaigns/glm53-nvfp4-csf/BENCHMARK-RECORD.md)
+— every measured row with its class and distribution), `PATCHES.md` (the
+provenance: the upstream base and every code delta from it), `BUILD.md`,
+the credits, and the third-party notices. The TensorFold *framework's* own
+documentation — its format recipes, install runbook, and feature docs —
+lives at the upstream repo (`asHHart/TensorFold`); nothing in this product
+depends on it. This repo serves the GLM-5.3 **NVFP4-CSF** pack on the GB10
+fleet, full stop.
 
 ## Settings (the knobs, their defaults, and why)
 
