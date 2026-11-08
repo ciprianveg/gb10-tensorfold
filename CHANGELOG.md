@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.0.1 — the guide test's harvest
+
+The first live deploy-through-the-README found and fixed a boot-fatal entry
+bug: the image's `tensorfold-serve` wrapper exec'd the binary with the old
+positional CLI (`serve PACK PORT CONTEXT`) while the binary speaks the
+argparse form — every rank refused at launch. The wrapper now execs the
+binary's actual CLI (`serve PACK --host 0.0.0.0 --port --context
+--parallel`, the form the production overlay wrapper always used).
+`start.sh` also gained the pre-boot stale-container clean (a re-boot after
+a failed or prior boot died on the container-name conflicts), and the
+README now states the first-deploy cost honestly: ~13 minutes for the
+image distribution to a fresh fleet (the master streams the 25.5 GB image
+to each worker; a once-per-image, once-per-node cost) — plus the topology
+note that only the master pulls from the registry; the workers receive the
+image from the master by design.
+
 ## v1.0.0 — the glm53-nvfp4-csf-final release
 
 The GLM-5.3 (NVFP4) TensorFold campaign's final state, packaged for deploy.
