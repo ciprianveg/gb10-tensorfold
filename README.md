@@ -76,7 +76,7 @@ pool), and `CONTEXT` (a request's claim bound).
 | Form | Shape | Use |
 |---|---|---|
 | `pool` (default) | DCP1, 4 slots, 600K shared pool | the measured best today: 4 concurrent streams with per-request claims — c4 85.7/87.4/76.3 (code/structured/prose) |
-| `capacity` | DCP2, 4 uniform slots, 300K each — **1.2M total KV** | the split-plane form — 4 uniform slots, no pool, the maximum uniform capacity |
+| `capacity` | DCP2, 4 slots — **1.2M total KV pool, 450K a stream's max context** | the split-plane form: the maximum-capacity pool — four streams claiming from 1.2M, each up to 450K deep |
 
 **The pool pins and the P4 form go together**: plain DCP1/P4 *without* the
 pool refuses at the prewarm budget (139 graphs, 8.7 GiB needed vs 6.7 free —
@@ -84,7 +84,7 @@ measured 2026-11-08). For the 2-slot speed form, run `PARALLEL=2 POOL_AGG=
 bash start.sh`.
 
 ```bash
-bash start.sh capacity       # the DCP2 split form
+bash start.sh capacity       # the DCP2 maximum-capacity form: the 1.2M pool
 bash start.sh stop           # the clean fleet teardown
 ```
 

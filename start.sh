@@ -8,7 +8,7 @@
 #                                      #   a 600K shared KV pool (200K a request's cap),
 #                                      #   the 262144 graph bucket floor
 #   bash start.sh pool                 #   same, explicit
-#   bash start.sh capacity             #   the DCP2 4-slot split form (300K x 4 = 1.2M total, no pool)
+#   bash start.sh capacity             #   the DCP2 4-slot form: a 1.2M total KV pool, 450K a stream's max context
 #   bash start.sh stop                 #   the clean fleet teardown
 #
 # THE POOL IS THE BEHAVIOR: mixed-length streams, first-fit claims, evict-oldest-idle,
@@ -46,7 +46,7 @@ ARM=${1:-pool}
 # ${VAR-default} (unset-only) so an EMPTY env var is a meaningful override (POOL_AGG= = no pool).
 case "$ARM" in
   pool)      DCP=1 PARALLEL=${PARALLEL-4} CONTEXT=${CONTEXT-200000} POOL_AGG=${POOL_AGG-600000} MIN_BUCKET=${MIN_BUCKET-262144};;
-  capacity)  DCP=2 PARALLEL=${PARALLEL-4} CONTEXT=${CONTEXT-300000} POOL_AGG= MIN_BUCKET=;;
+  capacity)  DCP=2 PARALLEL=${PARALLEL-4} CONTEXT=${CONTEXT-450000} POOL_AGG=${POOL_AGG-1200000} MIN_BUCKET=${MIN_BUCKET-262144};;
   stop)
     for n in $NODES; do
       ssh -o BatchMode=yes -o ConnectTimeout=10 "$n" \
