@@ -28,7 +28,7 @@ PORT=${PORT:-5901}
 IMAGE=${IMAGE:-ghcr.io/ciprianveg/gb10-tensorfold:latest}
 PACK=${PACK:-/home/ciprian/models/models11/GLM-5.3-NVFP4-CSF}
 DSPARK_PACK=${DSPARK_PACK:-/home/ciprian/models/models11/GLM-5.3-dspark}
-AOTDIR=${AOTDIR:-/home/ciprian/aot-world8-nvfp4-serve-copack-ord}
+AOTDIR=${AOTDIR:-/home/ciprian/aot-world8-nvfp4-serve-copack-ord-e3m}
 NODES=${NODES:-"192.168.178.111 192.168.178.112 192.168.178.113 192.168.178.114 192.168.178.115 192.168.178.116 192.168.178.117 192.168.178.118"}
 ARM=${1:-speed}
 
@@ -83,7 +83,7 @@ for n in $NODES; do
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$n" "docker run -d --name serve-r$idx --gpus all --network host --shm-size=2g \
     --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK \
     --user \$(id -u):\$(id -g) \
-    -v /home/ciprian/models:/home/ciprian/models:ro \
+    -v /home/ciprian/models:/home/ciprian/models \
     -v $DSPARK_PACK:/dspark:ro \
     -v $AOTDIR:/aot:ro \
     -e NCCL_SOCKET_IFNAME=enp1s0f1np1 -e NCCL_CUMEM_ENABLE=0 \
