@@ -48,7 +48,7 @@ docker pull ghcr.io/ciprianveg/gb10-tensorfold:latest
 # what's inside the image: PATCHES.md (the upstream base, every code
 # delta from it, the layer manifest — read it before the first boot)
 
-bash start.sh            # the speed tier: DCP1, 2 slots, 200K context
+bash start.sh            # THE DEFAULT: the pool-P4 form — DCP1, 4 slots, a 600K shared KV pool
 # ... the boot takes ~10-20 minutes (the model load dominates; watch:
 #   ssh <master> 'docker logs serve-r0 2>&1 | grep -E "SERVE up|BIND|error" | tail'
 
@@ -59,18 +59,30 @@ The serve speaks the OpenAI-compatible surface (`/v1/chat/completions`,
 `/v1/completions`, `/v1/models`) plus `/health`, on the port `start.sh` was
 given (default 5901).
 
-## The tier arms
+## The forms
 
-| Arm | Form | Use |
+The default is the **pool-P4 form**: DCP1, 4 concurrent slots, a 600K shared
+KV pool (200K a request's cap), the 262144 graph bucket floor. **The pool is
+the behavior**: mixed-length streams, first-fit claims, evict-oldest-idle,
+and an honest over-cap refusal at the API — the serve stays alive. The
+knobs, env-overridable at the `start.sh` invocation: `PARALLEL` (slots),
+`POOL_AGG` (the pool's aggregate; set it **empty** for the uniform
+pre-division path — the slots divide the window evenly, no pool), and
+`CONTEXT` (a request's cap).
+
+| Form | Shape | Use |
 |---|---|---|
-| `speed` (default) | DCP1, 2 concurrent slots, 200K context | the fast tier — the best single- and double-stream latency/throughput form |
-| `pool-600k` | DCP1, 4 slots, 600K aggregate pool (450K a request) | the 4-slot form at DCP1 — requests claim what they need; an over-capacity claim is refused at the API, the serve stays alive |
-| `capacity` | DCP2, 4 slots, 200K context each | the split-plane form — 4 uniform slots |
+| `pool` (default) | DCP1, 4 slots, 600K shared pool | the measured best today: 4 concurrent streams with per-request claims — c4 85.7/87.4/76.3 (code/structured/prose) |
+| `capacity` | DCP2, 4 uniform slots, 200K each | the split-plane form — 4 uniform slots, no pool |
+
+**The pool pins and the P4 form go together**: plain DCP1/P4 *without* the
+pool refuses at the prewarm budget (139 graphs, 8.7 GiB needed vs 6.7 free —
+measured 2026-11-08). For the 2-slot speed form, run `PARALLEL=2 POOL_AGG=
+bash start.sh`.
 
 ```bash
-bash start.sh pool-600k
-bash start.sh capacity
-bash start.sh stop        # the clean fleet teardown
+bash start.sh capacity       # the DCP2 split form
+bash start.sh stop           # the clean fleet teardown
 ```
 
 Measured receipts for the `speed` tier and the deep-context quality gates

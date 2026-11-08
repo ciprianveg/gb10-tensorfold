@@ -41,6 +41,39 @@ edge refusal at the API. **The first-fit fragmentation is real and honest**: a c
 CONTIGUOUS hole — concurrent arrivals that claim mid-plane can refuse a larger later claim whose
 rows would fit in sum; the ordered submit (the large claim first) packs the same set.
 
+## THE POOL-P4 ROWS (2026-11-08 — the measured default form, same-day, every row class/denominator/distribution)
+
+All rows same-day 2026-11-08, greedy temperature 0, the pool-P4 form (DCP1, 4
+slots, 600K shared pool, 200K caps) unless labeled otherwise.
+
+- **Snake-1500: 49.0 tok/s** (greedy, `/v1/completions`, the record's probe
+  class — the 1500-token single-HTML Snake game; same-day reads 48.4–49.2
+  across forms, the spread stated).
+- **The concurrency matrix at pool-P4** (512-token generations, greedy, 2 runs
+  per cell, the best reported per the convention):
+
+  | streams | code | structured | prose |
+  |---|---|---|---|
+  | c1 | 42.0 | 53.1 | 27.6 |
+  | c2 | 66.5 | 77.1 | 49.8 |
+  | c4 | 85.7 | 87.4 | 76.3 |
+
+- **The honest spread**: the c1-code cell read 47.5/46.0 in the same-day
+  earlier battery (same prompt, same form); the late-session dip (39.2/42.0)
+  coincided with heavy disk contention on the master. Distribution stated,
+  best-of-2 per the convention.
+- **Prefill 2×8K** (two distinct uncached prompts, `max_tokens=8`): **1282
+  tok/s aggregate** (above the 1181 receipt).
+- **The c2 trade, stated honestly**: pool-P4 reads ~5–7% below the P2 form
+  per-stream at c2 (66.5 vs the P2-era 69.50–70.89) — both forms' rows
+  carried, labeled by form. The P4 pool's c4 rows (85.7/87.4/76.3) are the
+  ones the P2 form cannot reach: its c4 runs as 2 waves (72.0).
+- **Determinism**: byte-identical greedy repeats, both probes, both forms.
+- **Needle**: 128K-depth two-fact retrieval PASS, 105–107 s, both forms.
+- **The pool-form anchor set of record** (8/8 reproduced across two same-day
+  boots; cross-era continuity with the pool-era binaries):
+  `f88320752d 4a56454311 3501b2452b 8490f74474 925cbb37e7 1195aad667 81485737e5 6642922800`.
+
 ## QUALITY
 
 - The needles: pristine across forms and depths to **360K+** (the varied numbered-entry class; the
