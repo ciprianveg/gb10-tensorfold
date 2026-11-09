@@ -90,7 +90,9 @@ link-bound stage; decode at these depths is link-insensitive).
   byte-identical across its forms — the layout-numerics shift known, quality-verified by the deep
   needles at every class.
 - Determinism: PASS (the sha-identity across runs, binaries, and concurrent-vs-sequential).
-- The deep-quality break root-caused to the pool's stale views — **never the model's limit**.
+- A quality break observed mid-campaign at deep contexts was root-caused to the
+  pool's stale-view bug (defect 1 in the root-cause arc below) — found, fixed,
+  and receipted; it was never a model limit. The current rows post-date the fix.
 
 ## CONCURRENCY AND THE TIER GEOMETRY (DCP1, code-class)
 
