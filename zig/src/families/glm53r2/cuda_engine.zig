@@ -105,6 +105,10 @@ pub const Options = struct {
     cublas_ws: ?usize = null,
     /// Â§125.37 the dense-lane A/B arm: the qmmf bf16 lane for the dense smalls' decode windows.
     dense_lane: bool = false,
+    /// TF_GLM53_HEAD_FP8 (off by default): the head's fp8-e4m3 128-block quantized-compute arm —
+    /// the pack at bind (cuda_bind.packHeadFp8), the read switch in cuda_forward.headLogits.
+    /// Loads the qmmf lane and the head's part scratch alongside the dense lane's.
+    head_fp8: bool = false,
     cublas_math: c_int = 0,
     /// the longest prompt plus reply a request may use (Glm53Engine.limit); the runner holds limit + k + 1
     context: usize = 32768,
@@ -220,6 +224,7 @@ pub const Options = struct {
         o.cublas_lib = env("TF_GLM53_CUBLAS_LIB") orelse o.cublas_lib;
         if (env("TF_GLM53_CUBLAS_WS")) |_| o.cublas_ws = try envInt(usize, "TF_GLM53_CUBLAS_WS", 0);
         o.dense_lane = env("TF_GLM53_DENSE_LANE") != null;
+        o.head_fp8 = env("TF_GLM53_HEAD_FP8") != null;
         o.k = try envInt(usize, "TF_GLM53_K", o.k);
         o.draft_vocab = try envInt(usize, "TF_GLM53_DRAFT_VOCAB", o.draft_vocab);
         o.mtp_reuse = try envInt(u32, "TF_GLM53_MTP_REUSE", o.mtp_reuse);
@@ -400,6 +405,9 @@ pub const Boot = struct {
     ws: cuda.DeviceBuffer,
     qlane: ?cuda.qmmf.Lane = null,
     qpart: cuda.DeviceBuffer = undefined,
+    /// TF_GLM53_HEAD_FP8: the head's own qmmf part scratch (the fp32 split-K partials at the
+    /// guard's row ceiling — the head's n is the vocab share, far past the dense lane's 16 MB carve).
+    hqpart: ?cuda.DeviceBuffer = null,
     blas: cuda.cublas.Blas,
     cache: ?prompt.UnpackCache = null,
     main_wide: prompt.Wide,
@@ -638,9 +646,19 @@ pub const Boot = struct {
         b.ws = try cuda.DeviceBuffer.alloc(&b.driver, @max(ws_bytes, 16));
         // Â§125.37: the dense-lane A/B arm - the lane (sm121: clusters on) + the fp32 partials
         // scratch at the max decode gate (sk<=8, R<=64, n<=6144 -> 12.6 MB; 16 MB carved).
-        if (o.dense_lane) {
+        if (o.dense_lane or o.head_fp8) {
             b.qlane = try cuda.qmmf.Lane.load(&b.driver, 12);
             b.qpart = try cuda.DeviceBuffer.alloc(&b.driver, 16 << 20);
+            // TF_GLM53_HEAD_FP8 rides the same lane: the head's own part scratch, sized at its
+            // guard (rows<=64 x the vocab share x sk<=8 x fp32 — ~40 MB at world 8, ~80 MB at 4).
+            if (o.head_fp8) {
+                if (b.w.head_fp8) |hq| {
+                    const hw = cuda.qmmf.Weight{ .mode = .fp8g, .codes = hq.codes, .scales = hq.scales,
+                        .n = @intCast(b.w.vocab_part), .k = @intCast(b.w.config.hidden), .npad = hq.npad };
+                    const pb = b.qlane.?.partBytes(64, hw);
+                    b.hqpart = try cuda.DeviceBuffer.alloc(&b.driver, @max(pb, 16));
+                }
+            }
         }
         b.stage = 12;
         b.blas = try cuda.cublas.Blas.init(&b.blas_lib, b.ws.ptr, ws_bytes, o.cublas_math);
@@ -733,7 +751,7 @@ pub const Boot = struct {
         if (o.e1_fp8) std.log.info("glm53 rank {d}: e4m3 E1 query wire on (TF_GLM53_E1_FP8): the DCP query gather ships kv8Quant-packed rows (584 B: codes + s0/s1), half the bytes; the scorer dequantizes in-register - the scores change q-side, the needle/coherence gates decide (findings-dcp8.md section 18)", .{o.rank});
         if (o.fp8_index and o.fp8_stride == 144) std.log.info("glm53 rank {d}: padded fp8 index plane on (TF_GLM53_FP8_STRIDE=144): 144-byte token rows - a 16-byte-multiple stride, the native scorer's 16-byte staging path (glm53_fp8_scores_p, 2 CTAs/SM) and TMA-expressible; needs the _ik_write8p / _index_scores8p AOT variants (the recapture); the scores are BIT-IDENTICAL to the 132 layout (only the addresses move)", .{o.rank});
         if (o.prompt_sp and o.world > 1 and !o.fp8_index) std.log.info("glm53 rank {d}: sequence-parallel prompt chunks on (TF_GLM53_PROMPT_SP{s}{s}): the halves' comm chains on the side stream overlapped with the main-stream compute - under kv8 the halves stage through the side stream's OWN Kv8 (the per-stream staging, findings-prefill-sp-restore.md); under DCP the chains split attentionDcp (E1/E3 on the side, the scoring on the main - findings-sp-under-dcp.md section 2)", .{ o.rank, if (o.kv8) " + KV8" else "", if (b.dcp > 1) " + DCP" else "" });
-        b.fwd = .{ .w = &b.w, .k = &b.k, .s = b.stream, .inv = b.inv.ptr, .comm = &b.comm, .fast = b.fast, .ring = true, .wide = &b.main_wide, .blas = &b.blas, .qlane = if (b.qlane) |*x| x else null, .qpart = if (o.dense_lane) b.qpart.ptr else 0, .shared_experts = shared, .pe_det16 = det16, .side = if (b.side) |*x| x else null, .l2pf = if (b.l2pf) |*x| x else null, .multi_select = o.multi_select, .topk_stream = o.topk_stream, .fp8_index = o.fp8_index, .fp8_stride = o.fp8_stride, .e1_fp8 = o.e1_fp8, .e3_merge = o.e3_merge, .lane_pick = &b.window_lane, .prof = if (b.prof) |*x| x else null, .mtp_dense = if (b.mtp_dense) |*x| x else null, .dcp = b.dcp, .taps = try fw.Taps.of(&b.plan), .kv8 = if (b.kv8) |*x| x else null, .kv8_v2 = o.kv8_v2 };
+        b.fwd = .{ .w = &b.w, .k = &b.k, .s = b.stream, .inv = b.inv.ptr, .comm = &b.comm, .fast = b.fast, .ring = true, .wide = &b.main_wide, .blas = &b.blas, .qlane = if (b.qlane) |*x| x else null, .qpart = if (o.dense_lane) b.qpart.ptr else 0, .hpart8 = if (b.hqpart) |*p| p.ptr else 0, .shared_experts = shared, .pe_det16 = det16, .side = if (b.side) |*x| x else null, .l2pf = if (b.l2pf) |*x| x else null, .multi_select = o.multi_select, .topk_stream = o.topk_stream, .fp8_index = o.fp8_index, .fp8_stride = o.fp8_stride, .e1_fp8 = o.e1_fp8, .e3_merge = o.e3_merge, .lane_pick = &b.window_lane, .prof = if (b.prof) |*x| x else null, .mtp_dense = if (b.mtp_dense) |*x| x else null, .dcp = b.dcp, .taps = try fw.Taps.of(&b.plan), .kv8 = if (b.kv8) |*x| x else null, .kv8_v2 = o.kv8_v2 };
         if (b.bind_hook) |*hk| b.fwd.moe_hook = .{ .ctx = hk, .has = binder.Hook.has, .call = binder.Hook.call }; // §98: the port's MoE block over the bound weights
         // SP under DCP: on when the world splits and fp8_index is off (the e4m3 index plane has no DCP port -
         // findings-dcp8.md section 5; the refusal is Sp's chunk, this only avoids building buffers that cannot run)
@@ -747,7 +765,7 @@ pub const Boot = struct {
         try b.checkCacheFits(capacity);
         // --parallel N: N slots of the caches; copy drafts are one stream's (Runner: slots == 1)
         const copy_set: copies.Settings = if (o.parallel > 1) .{ .on = false, .match = 0, .most = 0 } else o.copy;
-        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .dcp_prompt_rows = o.dcp_prompt_rows, .prompt_sp = o.prompt_sp, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp, .verify_rows = o.verify_rows, .draft_rows = if (b.dspark_cfg != null) b.dspark_set.depth + 1 else 0, .copy = copy_set, .slots = o.parallel, .kv8 = o.kv8, .kv8_v3 = o.kv8_v3, .pool_agg = o.pool_agg }); // 126.6r: the RUNTIME depth keys the verify-window enumeration (not the checkpoint's block - the 126.6(i) trap); at depth 6 the graphs capture 7-row windows; the 21 bound (d6 x numseq-3) is the multi-stream seam's guard
+        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .dcp_prompt_rows = o.dcp_prompt_rows, .prompt_sp = o.prompt_sp, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp, .verify_rows = o.verify_rows, .draft_rows = if (b.dspark_cfg != null) b.dspark_set.depth + 1 else 0, .copy = copy_set, .slots = o.parallel, .kv8 = o.kv8, .kv8_v3 = o.kv8_v3, .pool_agg = o.pool_agg, .rdv = &b.rdv }); // 126.6r: the RUNTIME depth keys the verify-window enumeration (not the checkpoint's block - the 126.6(i) trap); at depth 6 the graphs capture 7-row windows; the 21 bound (d6 x numseq-3) is the multi-stream seam's guard
         b.stage = 18;
         // Phase 4: the drafters on every rank (each its heads / MLP share), attached to the runner before its prewarm
         if (b.dflash_cfg != null) {
@@ -880,6 +898,10 @@ pub const Boot = struct {
         // TF_GLM53_KV8's side buffers (staging, the decode scratch, the prompt mirror) sit beside the caches
         // the side stream's own kv8 staging (SP under kv8) sits beside the caches too
         const extra: u64 = (if (b.kv8) |*v| v.bytes() else 0) + (if (b.sp) |*sp| (if (sp.kv8) |kv| kv.bytes() else 0) else 0);
+        // §128.27hz+ THE DCP1 POOL: the pool read hoisted above the guard - POOL_AGG at dcp=1 takes the
+        // pool branch too (the user's DCP1-P4-POOL form at the 600K cap: the whole un-split plane, the
+        // same 33.9 GiB arithmetic the 600K x 1 probe proved). Without POOL_AGG at dcp=1 the uniform
+        // cacheFit path below is UNCHANGED (no co-landing with any receipted form).
         const pool_agg: ?usize = blk: {
             const e = std.c.getenv("TF_GLM53_POOL_AGG") orelse break :blk null;
             break :blk std.fmt.parseInt(usize, std.mem.sliceTo(e, 0), 10) catch null; // the empty-string trap: the launcher's unset -e values parse-fail to null
@@ -898,6 +920,12 @@ pub const Boot = struct {
             // and the floor (11) keeps the prewarm/graph-capture off the memory wall. The 3x316K wedge
             // receipt: reserve 25 passed the fit, the capture wedged at ~8.4 free.
             const s_floor: f64 = if (std.c.getenv("TF_GLM53_PREWARM_END_FREE_GB")) |v| (std.fmt.parseFloat(f64, std.mem.span(v)) catch 11) else 11;
+            // §128.27az THE POOL (TF_GLM53_POOL_AGG): the plane at the max AGGREGATE, fit ONCE (not
+            // parallel x the full window) - the mixed shape's arithmetic (400+300+100+100 = the
+            // actual mix's sum, not 4 x 450K). The reserve S unchanged (the working share shrinks
+            // with the demultiplication, a separate landing). (The read hoisted above the guard at
+            // §128.27hz+ for the dcp=1 pool form; the arithmetic here is dcp-generic - bytesForDcpV3
+            // divides by dcp, the claim's need = ceil/dcp + 1.)
             const per: u64 = fw.State.bytesForDcpV3(&b.w, if (pool_agg) |agg| agg else capacity, b.dcp, b.o.kv8, b.o.kv8_v3);
             const sf = dcpm.streamsFit(per, if (pool_agg != null) 1 else b.o.parallel, free, sgb + s_floor);
             const gib_f: f64 = 1 << 30;
@@ -1082,6 +1110,10 @@ pub const Boot = struct {
 pub fn checkParallel(o: Options, dcp: usize) !void {
     if (o.parallel <= 1) return;
     const quiet = @import("builtin").is_test;
+    // §128.27az THE POOL: the blanket DCP>1 requirement relaxes to the fit-check under the pool -
+    // at DCP1 the aggregate IS the per-rank cache load (the physics stands, §128.27av), and the
+    // pooled fit (the plane at the aggregate, cuda_boot's check) is the authority that decides.
+    // The 200K/stream DCP1 bound was the fixed-splits' artifact; the pool admits what fits.
     if (o.pool_agg != null) return;
     if (dcp > 1) {
         if (!o.dcp_streams) {

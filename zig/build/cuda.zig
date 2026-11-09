@@ -211,6 +211,12 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const runtime_host = b.step("test-runtime-host", "Shared CUDA runtime and graph host regressions");
     runtime_host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda })).step);
     const mods = family(b, host, .debug, cuda, draft_ids);
+    // the glm53r2 lane's host gate (the A1/A2 gate restored to this layer): the family module
+    // analyzed as a unit on the host — the config/weights/binder test sweep, the binder carrying
+    // the fp8 canary and the head fp8 pack tests.
+    const glm53 = engines_build.glm53Cuda(b, host, .debug, cuda, mods.core);
+    const glm53r2 = engines_build.glm53r2Cuda(b, host, .debug, cuda, mods.core, glm53, mods.lanes);
+    b.step("test-glm53r2-host", "GLM-5.3 on r2's engine: the family compiles and its host tests run (the binder: the fp8 canary + the head fp8 pack)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm53r2 })).step);
     const omni_slide = b.addRunArtifact(b.addTest(.{ .root_module = mods.nemotron, .filters = &.{"Omni learner:"} }));
     const omni_slide_step = b.step("test-omni-slide-host", "Omni learner registration, widths and scoped tensors without devices");
     omni_slide_step.dependOn(&omni_slide.step);

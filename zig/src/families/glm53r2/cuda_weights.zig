@@ -93,6 +93,13 @@ pub const DraftHead = struct {
 /// vocabulary share; the share starts `off` outputs into the launch's result.
 pub const HeadQ = struct { lin: exl3.Linear, off: usize };
 
+/// TF_GLM53_HEAD_FP8 (off by default): this rank's lm_head share packed to the fp8-e4m3 128-block
+/// form at load — the canary's qmmf .fp8g weight class (cuda_bind.packHeadFp8), read by the head's
+/// quantized-compute launch instead of the bf16 router. The bf16 rows stay bound (the A/B is one env
+/// away, no reload). Unlike the EXL3 head the vocab share needs no 128-block cutting: the pack pads
+/// rows to `npad` internally and the kernel reads the true `n`.
+pub const Fp8Head = struct { codes: u64, scales: u64, npad: u32 };
+
 pub const Weights = struct {
     gpa: std.mem.Allocator,
     config: Config,
@@ -103,6 +110,7 @@ pub const Weights = struct {
     final_norm: u64 = 0, // bf16 [D] (model.norm)
     lm_head: u64 = 0, // bf16 [V / world, D]: this rank's vocabulary share (rows vocab_off ..); 0 with head_q
     head_q: ?HeadQ = null, // TF_GLM53_HEAD_Q: the quantized head instead (the same share, the same vocab_off)
+    head_fp8: ?Fp8Head = null, // TF_GLM53_HEAD_FP8: the fp8-e4m3 128-block pack of the same share (the bf16 rows stay)
     /// with head_q and Options.head_host: this rank's bf16 lm_head rows [vocab_part, D] on the host, for the
     /// drafters' 4-bit head (cuda_draft.buildDraftHead takes and frees them)
     head_host: []u16 = &.{},
@@ -535,6 +543,10 @@ const Loader = struct {
             .wk = 0,
             .dense = true,
         };
+        // 126.6(at) the fp8 canary (TF_GLM53_DENSE_FP8, value semantics): the pack's OWN e4m3
+        // codes and 128-block scales repacked for qmmf's .fp8g mode - NO re-quantization. Every
+        // e4m3 value is exact in bf16, and the kernel's f32 scale product skips the bf16 rounding
+        // the dequant path adds: the fp8 read is the MORE exact form of the same stored weights.
         if (fp8Arm()) {
             const npad8 = cuda.fp8.padded(n);
             const pc = try L.gpa.alloc(u8, npad8 * k);

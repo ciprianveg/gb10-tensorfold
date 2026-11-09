@@ -62,10 +62,47 @@ pub fn deliverPending(h: *LaneHost) void {
     }
 }
 
-/// A round the backend failed: the failure hook hears the error and every admitted stream gets its name.
+/// A round the backend failed: the failure hook hears the error and the ROUND'S OWN streams get
+/// its name — the participants alone. §THE SECOND WINDOW'S RECEIPT (2026-11-09): the old form
+/// ended EVERY admitted job, murdering innocent partners outside the failed round (the bench's
+/// parallel-2 pairs, identical durations). The per-stream classes never reach here anymore (the
+/// isolation marks the guilty stream and the round continues); what remains is genuinely
+/// round-level, and it takes the round's streams — the queued and the not-yet-started are spared
+/// (their own pieces fail per-job if the backend is truly unhealthy).
 pub fn failRound(h: *LaneHost, err: anyerror) void {
     failed(h, err);
-    failAll(h, @errorName(err));
+    std.log.warn("lane host: a round failed ({s}): the round's streams fail, the rest are spared", .{@errorName(err)});
+    h.core.sweep() catch {};
+    h.lock();
+    var jobs = h.admitted;
+    h.admitted = .empty;
+    h.filling.clearRetainingCapacity();
+    h.unlock();
+    defer jobs.deinit(h.gpa);
+    for (jobs.items) |job| {
+        // in the round: the job's stream is one the core is decoding
+        var in_round = false;
+        if (job.started) for (h.core.live.items) |x| {
+            if (x == &job.stream) {
+                in_round = true;
+                break;
+            }
+        };
+        if (!in_round) {
+            h.lock();
+            const back = h.admitted.append(h.gpa, job);
+            h.unlock();
+            if (back) |_| continue else |_| {
+                // the list is gone: fail it rather than leak a job
+                if (job.started and !job.stream.finished) h.core.discard(&job.stream);
+                h.finish(job, .failed, @errorName(err));
+                continue;
+            }
+        }
+        // a job admitted this round has no stream yet when the planner's admitted callback fails
+        if (job.started and !job.stream.finished) h.core.discard(&job.stream);
+        h.finish(job, .failed, @errorName(err));
+    }
 }
 
 /// A failed round ends every job it admitted, with the backend's error; the list is taken whole, not copied.

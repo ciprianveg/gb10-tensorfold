@@ -67,6 +67,21 @@ bash start.sh capacity       # the DCP2 maximum-capacity form: the 1.2M pool
 bash start.sh stop           # the clean fleet teardown
 ```
 
+## Structured output
+
+`response_format: {"type": "json_schema"}` and `tool_choice: "required"` or
+named are **supported**: the grammar library (libtfgrammar, xgrammar v0.2.8)
+ships in the image and lazy-loads at the **first structured request** —
+free-form serving never loads it, and free-form bits are byte-identical with
+the lane armed (the boot's anchors gate receipts this). Token picks are
+constrained per-position under the compiled schema, server-side; agent
+clients get guaranteed-well-formed call JSON with `tool_choice: "required"`.
+
+The honest cost: a masked round's token pick rides a host-side rendezvous
+exchange across the ranks (sub-millisecond per token typical; a fully
+masked long generation pays it per token, per stream). Free-form rounds pay
+nothing.
+
 ## Performance (the pool-P4 form, same-day 2026-11-08, greedy)
 
 Every number in this section and in the benchmark record was measured on a
@@ -83,9 +98,9 @@ Decode, aggregate across concurrent streams (512-token generations,
 
 \* **JSON-output, not JSON-constrained**: these are free-form generations
 prompted to produce JSON — no grammar, no schema enforcement. The
-grammar-constrained structured-output path is parked (unverified;
-`response_format` is unsupported) and contributes nothing to these
-numbers.
+structured-output lane (`response_format` with a json_schema) is supported
+as of the v1.0.3 binary class, but these rows were measured free-form —
+grammar-constrained serving contributes nothing to them.
 
 The Snake-1500 probe (the record's own class): **49.0 tok/s**. Prefill,
 two distinct uncached ~8K prompts at once: **1282 tok/s** aggregate.
@@ -176,12 +191,11 @@ receipted production configuration — change one only with a reason.
 
 ## Known issues and limitations (honest, per the receipts)
 
-- **Structured output is not enforced yet.** `response_format` is unsupported
-  and `tool_choice: "required"`/named returns a clean 400 — the token-grammar
-  lane is built but parked pending one mid-round collective. Agent clients
-  must use `tool_choice: auto` with tightly-typed tool schemas; the model
-  calls tools when appropriate and emits well-formed call JSON, but nothing
-  constrains the output tokens yet.
+- **Structured output costs a per-token exchange on masked rounds.** With
+  `response_format` (json_schema) or `tool_choice: "required"`/named active,
+  each masked round's token pick rides a host-side rendezvous exchange
+  across the ranks (sub-ms per token typical; a fully-masked long generation
+  pays it per token, per stream). Free-form rounds pay nothing.
 - **Multi-turn resume trades small-turn latency for correctness.** A grown
   conversation re-computes the tail of the kept context at the resume (the
   exact-bits form); big turns get fast resume, small turns pay a visible

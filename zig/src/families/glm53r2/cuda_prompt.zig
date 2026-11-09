@@ -392,6 +392,9 @@ pub const Sp = struct {
             sp.kv8 = kv;
             sp.side.kv8 = kv;
         }
+        // 126.6(ae): the one-shot ag for the prompt chains - captured from main.fast, the env's
+        // VALUE semantics; the staging allocated only when on (the member block <= the 1 MiB slot;
+        // the product chunks' halves ~0.6 MB - the bigger chunks keep the NCCL ring, the size check at the call).
         if (main.fast != null and spAgOn()) {
             sp.roce = main.fast;
             sp.roce_ag = true;
@@ -447,6 +450,8 @@ pub const Sp = struct {
         // section 5) - SP+DCP serves with TF_GLM53_FP8_INDEX off, like every DCP boot.
         if (f.dcp > 1 and f.fp8_index) return error.SpWithDcp;
         if (!spFits(f.w.world, b0.rows, b1.rows, R))return error.WindowTooWide;
+        // 126.6(am): the chunk-boundary epoch re-sync - the phase boundary where any launch-count
+        // divergence self-heals (the streams synced at the chunk's start; no one-shot in flight).
         if (sp.roce_ag) try sp.roce.?.resync(sp.comm, f.s, sp.rs_a.?.ptr, sp.rs_b.?.ptr);
         try o.copy(b1.ids, b0.ids + hR * 8, (R - hR) * 8);
         try o.fill32(sp.pos1.ptr, @intCast(a + hR), 1);
@@ -728,6 +733,19 @@ pub const Sp = struct {
         if (f.dcp > 1) {
             // section 15: the select - the iq from the gathered qn, roped at the half's own positions
             // (the rows are contiguous: position = h.pos + r).
+            // §128.27aq THE ROW-SPLIT (the prefill-decay fix, findings §128.27ap/aq): the all-rows form
+            // was 4x redundant across the blocks at world 8 / dcp 2 (every rank scored+topk'd ALL rows
+            // over its shard so every rank held the whole tok without an exchange - the measured cost:
+            // the select pipeline ~2.6x DCP1's per rank at depth, THE decay's cause). Now each BLOCK
+            // takes its share of the rows through the UNCHANGED pair pipeline (both pair ranks process
+            // the same slice; the dcpGather and the dcpMerge work per 128-row block, row-independent),
+            // and one world all-gather of the merged slices (~2 MB/chunk, staged in b.sc - free here:
+            // post-merge, pre-next-layer) fills every rank's tok/cnt. EXACTNESS: a row's per-shard
+            // top-K candidate lists are over full head sums; dcpMerge's union argument is row-independent
+            // (the global top-K is within the union of the per-shard top-Ks, merged by whole key, the
+            // tie rule untouched); the slices move as raw i32 words - tok/cnt BIT-IDENTICAL to the
+            // all-rows form. At dcp == world (nb == 1) every rank already holds all rows: unchanged.
+            // TF_GLM53_SELECT_ROWSPLIT=0 restores the all-rows form (the revert).
             const rowsplit = blk: {
                 const e = std.c.getenv("TF_GLM53_SELECT_ROWSPLIT") orelse break :blk true;
                 break :blk !std.mem.eql(u8, std.mem.sliceTo(e, 0), "0");

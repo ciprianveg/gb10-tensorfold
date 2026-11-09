@@ -68,6 +68,33 @@ fn fp8Arm() bool {
     return fp8_arm.?;
 }
 
+/// TF_GLM53_HEAD_FP8 (off by default): the head's own arm, independent of the dense smalls'
+/// TF_GLM53_DENSE_FP8 — the A/Bs are separately switchable.
+var head_fp8_arm: ?bool = null;
+fn headFp8Arm() bool {
+    if (head_fp8_arm == null) head_fp8_arm = blk: {
+        const v = std.c.getenv("TF_GLM53_HEAD_FP8") orelse break :blk false;
+        const s = std.mem.span(v);
+        break :blk s.len > 0 and !std.mem.eql(u8, s, "0");
+    };
+    return head_fp8_arm.?;
+}
+
+/// TF_GLM53_DENSE_FP8_FULL (off by default): the mlp's gate/up/down — the dense MLPs AND the
+/// shared experts, the same struct — plus the indexer's wq_b join the smalls' fp8 lane at the
+/// decode windows. Rides the smalls' TF_GLM53_DENSE_FP8 (the full = the superset; the boot form
+/// sets both, the A/B's delta = exactly this set). The read path is denseGemm's existing
+/// per-linear l.qfp8 branch — the bind-side pack is the only new work.
+var dense_fp8_full_arm: ?bool = null;
+fn denseFp8FullArm() bool {
+    if (dense_fp8_full_arm == null) dense_fp8_full_arm = blk: {
+        const v = std.c.getenv("TF_GLM53_DENSE_FP8_FULL") orelse break :blk false;
+        const s = std.mem.span(v);
+        break :blk s.len > 0 and !std.mem.eql(u8, s, "0");
+    };
+    return dense_fp8_full_arm.?;
+}
+
 fn bf16Val(h: u16) f32 {
     return @bitCast(@as(u32, h) << 16);
 }
@@ -169,6 +196,41 @@ fn packLane(d: *const cuda.Driver, stream: cuda.Stream, w: *W.Weights, ptr: u64,
     return .{ .qwords = dc.ptr, .qscales = ds.ptr, .fp8 = true };
 }
 
+/// The head's fp8 pack (TF_GLM53_HEAD_FP8): this rank's lm_head share [vocab_part, D] bf16 -> the
+/// same 128-block e4m3 codes + scale form packLane's fp8 arm builds, for the head's quantized-
+/// compute launch (cuda_forward.headLogits). The bf16 tensor stays bound: the A/B is one env away
+/// with no reload. A separate function by design — packLane (the shipped smalls' path) is untouched.
+fn packHeadFp8(d: *const cuda.Driver, stream: cuda.Stream, w: *W.Weights, ptr: u64, n: usize, k: usize) !?W.Fp8Head {
+    if (ptr == 0 or n == 0) return null;
+    const host_w = try w.gpa.alloc(u16, n * k);
+    defer w.gpa.free(host_w);
+    try d.check(d.api.cuMemcpyDtoHAsync_v2(host_w.ptr, ptr, n * k * 2, stream.handle), "DtoH");
+    try d.check(d.api.cuStreamSynchronize(stream.handle), "sync");
+    const br = (n + 127) / 128;
+    const bc = (k + 127) / 128;
+    const codes = try w.gpa.alloc(u8, n * k);
+    defer w.gpa.free(codes);
+    const grid = try w.gpa.alloc(f32, br * bc);
+    defer w.gpa.free(grid);
+    quantFp8Block(codes, grid, host_w, n, k);
+    const npad = cuda.fp8.padded(n);
+    const pc = try w.gpa.alloc(u8, npad * k);
+    defer w.gpa.free(pc);
+    cuda.fp8.packCodes(pc, codes, n, k);
+    const pt = try w.gpa.alloc(f32, npad * (k / 64));
+    defer w.gpa.free(pt);
+    cuda.fp8.packScales(pt, grid, n, k);
+    const dc = try cuda.DeviceBuffer.alloc(d, npad * k);
+    try w.buffers.append(w.gpa, dc);
+    try d.check(d.api.cuMemcpyHtoDAsync_v2(dc.ptr, pc.ptr, npad * k, stream.handle), "HtoD");
+    const ds = try cuda.DeviceBuffer.alloc(d, npad * (k / 64) * 4);
+    try w.buffers.append(w.gpa, ds);
+    try d.check(d.api.cuMemcpyHtoDAsync_v2(ds.ptr, pt.ptr, npad * (k / 64) * 4, stream.handle), "HtoD");
+    try d.check(d.api.cuStreamSynchronize(stream.handle), "sync");
+    std.log.info("glm53: the head fp8 pack: {d}x{d} -> qmmf fp8g (npad {d}, scales {d})", .{ n, k, npad, br * bc });
+    return .{ .codes = dc.ptr, .scales = ds.ptr, .npad = @intCast(npad) };
+}
+
 test "f32ToE4m3: every finite e4m3 value round-trips exactly; the bounds saturate" {
     const cw = @import("cuda_weights.zig");
     var c: u16 = 0;
@@ -188,6 +250,127 @@ test "f32ToE4m3: every finite e4m3 value round-trips exactly; the bounds saturat
             try std.testing.expect(@abs(d - v) <= @abs(v) * 0.0625 + 2e-3);
         } else {
             try std.testing.expectEqual(@as(f32, 0), d);
+        }
+    }
+}
+
+test "the head fp8 pack: the 128-block round-trip error bound (head-shaped, the pad class)" {
+    // TF_GLM53_HEAD_FP8's host half: a synthetic head-shaped bf16 [n, k] (n = 2.5 blocks so the
+    // 128-pad class is exercised) through quantFp8Block, dequantized by the reference — every
+    // element within the e4m3 half-ULP (2^-4 relative) + the block scale's subnormal step.
+    const cw = @import("cuda_weights.zig");
+    const n = 320;
+    const k = 256;
+    var prng = std.Random.DefaultPrng.init(0x48454144);
+    const w = try std.testing.allocator.alloc(u16, n * k);
+    defer std.testing.allocator.free(w);
+    for (w) |*v| v.* = cw.bf16Bits(prng.random().floatNorm(f32) * 3.0);
+    const br = (n + 127) / 128;
+    const bc = (k + 127) / 128;
+    const codes = try std.testing.allocator.alloc(u8, n * k);
+    defer std.testing.allocator.free(codes);
+    const grid = try std.testing.allocator.alloc(f32, br * bc);
+    defer std.testing.allocator.free(grid);
+    quantFp8Block(codes, grid, w, n, k);
+    for (0..n) |i| {
+        for (0..k) |j| {
+            const sc = grid[(i / 128) * bc + (j / 128)];
+            const deq = cw.fp8ToF32(codes[i * k + j]) * sc;
+            const orig = bf16Val(w[i * k + j]);
+            const tol = @abs(orig) * 0.0625 + sc * 0.02 + 1e-6;
+            try std.testing.expect(@abs(deq - orig) <= tol);
+        }
+    }
+}
+
+test "the head fp8 read class: the dequant GEMM's delta bound vs the bf16 reference (host)" {
+    // The read-path correctness class short of the GPU kernel (the qmmf .fp8g launch itself is
+    // the smalls' shipped, proven kernel): every |fp8_logit - bf16_logit| within the derived
+    // per-element bound sum_j |x_j| * err(w_j), and where the bf16 top-1's margin clears twice
+    // the bound the fp8 top-1 must agree — deterministic, no distribution assumed.
+    const cw = @import("cuda_weights.zig");
+    const m = 4;
+    const n = 256;
+    const k = 128;
+    var prng = std.Random.DefaultPrng.init(0x48454144 + 1);
+    const xs = try std.testing.allocator.alloc(f32, m * k);
+    defer std.testing.allocator.free(xs);
+    for (xs) |*v| v.* = prng.random().floatNorm(f32);
+    const w = try std.testing.allocator.alloc(u16, n * k);
+    defer std.testing.allocator.free(w);
+    for (w) |*v| v.* = cw.bf16Bits(prng.random().floatNorm(f32) * 2.0);
+    const br = (n + 127) / 128;
+    const bc = (k + 127) / 128;
+    const codes = try std.testing.allocator.alloc(u8, n * k);
+    defer std.testing.allocator.free(codes);
+    const grid = try std.testing.allocator.alloc(f32, br * bc);
+    defer std.testing.allocator.free(grid);
+    quantFp8Block(codes, grid, w, n, k);
+    for (0..m) |r| {
+        var best_bf16: f64 = -std.math.inf(f64);
+        var best_fp8: f64 = -std.math.inf(f64);
+        var top_bf16: usize = 0;
+        var top_fp8: usize = 0;
+        var second_bf16: f64 = -std.math.inf(f64);
+        var max_bound: f64 = 0;
+        for (0..n) |i| {
+            var lb: f64 = 0;
+            var lf: f64 = 0;
+            var bound: f64 = 0;
+            for (0..k) |j| {
+                const x: f64 = xs[r * k + j];
+                const orig: f64 = bf16Val(w[i * k + j]);
+                const sc = grid[(i / 128) * bc + (j / 128)];
+                const deq: f64 = cw.fp8ToF32(codes[i * k + j]) * sc;
+                lb += x * orig;
+                lf += x * deq;
+                bound += @abs(x) * (@abs(orig) * 0.0625 + sc * 0.02);
+            }
+            try std.testing.expect(@abs(lf - lb) <= bound + 1e-6);
+            max_bound = @max(max_bound, bound);
+            if (lb > best_bf16) {
+                second_bf16 = best_bf16;
+                best_bf16 = lb;
+                top_bf16 = i;
+            } else if (lb > second_bf16) second_bf16 = lb;
+            if (lf > best_fp8) {
+                best_fp8 = lf;
+                top_fp8 = i;
+            }
+        }
+        // the margin-gated agreement: a bf16 top-1 clear of the second by more than twice the
+        // worst per-logit bound cannot move under the fp8 read — deterministic, no distribution
+        if (best_bf16 - second_bf16 > 2 * max_bound) {
+            try std.testing.expectEqual(top_bf16, top_fp8);
+        }
+    }
+}
+
+test "the dense-full pack: the mlp-class shapes round-trip the same bound (gate-shaped, n=1536)" {
+    // TF_GLM53_DENSE_FP8_FULL's host half: the mlp gate/up/down shapes through the same
+    // quantFp8Block — the packer is shape-agnostic, this guards the class's own geometry
+    // (n a full 12 blocks, k the hidden dim's scale class).
+    const cw = @import("cuda_weights.zig");
+    const n = 1536;
+    const k = 512;
+    var prng = std.Random.DefaultPrng.init(0x4d4c5038);
+    const w = try std.testing.allocator.alloc(u16, n * k);
+    defer std.testing.allocator.free(w);
+    for (w) |*v| v.* = cw.bf16Bits(prng.random().floatNorm(f32) * 5.0);
+    const br = (n + 127) / 128;
+    const bc = (k + 127) / 128;
+    const codes = try std.testing.allocator.alloc(u8, n * k);
+    defer std.testing.allocator.free(codes);
+    const grid = try std.testing.allocator.alloc(f32, br * bc);
+    defer std.testing.allocator.free(grid);
+    quantFp8Block(codes, grid, w, n, k);
+    for (0..n) |i| {
+        for (0..k) |j| {
+            const sc = grid[(i / 128) * bc + (j / 128)];
+            const deq = cw.fp8ToF32(codes[i * k + j]) * sc;
+            const orig = bf16Val(w[i * k + j]);
+            const tol = @abs(orig) * 0.0625 + sc * 0.02 + 1e-6;
+            try std.testing.expect(@abs(deq - orig) <= tol);
         }
     }
 }
@@ -275,6 +458,10 @@ pub fn bind(
         .vocab_part = pw.share.vocab.len(),
         .vocab_off = pw.share.vocab.lo,
     };
+    // TF_GLM53_HEAD_FP8 (off by default): the head's fp8-e4m3 128-block pack at load — the canary's
+    // qmmf .fp8g weight form, read by cuda_forward.headLogits's quantized-compute branch. The bf16
+    // rows stay bound: the A/B is one env away with no reload.
+    if (headFp8Arm()) w.head_fp8 = try packHeadFp8(d, stream, &w, w.lm_head, w.vocab_part, c.hidden);
     w.layers = try a.alloc(W.Layer, pw.layers.len);
     errdefer a.free(w.layers);
 
@@ -297,6 +484,8 @@ pub fn bind(
             .mlp = .{ .gate = denseLinear(0, 0, 0), .up = denseLinear(0, 0, 0), .down = denseLinear(0, 0, 0) },
         };
         // Â§125.38: the dense-lane arm - the packed copies for the attention smalls (the 26.2 ms term).
+        // 126.6(at): the lane pack - the fp8 canary's codes+scales when the arm is on, else the
+        // 125.37 bf16 lane (the product default).
         const lane_smalls = [_]*exl3.Linear{ &L.q_a, &L.kv_a, &L.q_b, &L.o_proj };
         for (lane_smalls) |lin| {
             const pq = try packLane(d, stream, &w, lin.words, lin.n, lin.k);
@@ -352,6 +541,27 @@ pub fn bind(
                 stats.experts += 1;
                 stats.moe += 1;
             },
+        }
+        // TF_GLM53_DENSE_FP8_FULL (off by default): the mlp's gate/up/down — the dense MLPs AND
+        // the shared experts, the same struct, the biggest bf16 byte share at the decode windows —
+        // plus the indexer's wq_b join the smalls' fp8 lane. The same packLane (the fp8 branch
+        // under the smalls' arm), the same denseGemm read branch, the same R<=64 decode guard.
+        // The bf16 rows stay bound: the no-reload A/B, at the price of ~2.2 GB/rank of pack
+        // copies (the prewarm's fit check gates the boot if the plane is too tight).
+        if (denseFp8FullArm() and fp8Arm()) {
+            const full_linears = [_]*exl3.Linear{ &L.mlp.gate, &L.mlp.up, &L.mlp.down };
+            for (full_linears) |lin| {
+                const pq = try packLane(d, stream, &w, lin.words, lin.n, lin.k);
+                lin.qwords = pq.qwords;
+                lin.qscales = pq.qscales;
+                lin.qfp8 = pq.fp8;
+            }
+            if (L.indexer) |*ix| {
+                const pq = try packLane(d, stream, &w, ix.wq_b.words, ix.wq_b.n, ix.wq_b.k);
+                ix.wq_b.qwords = pq.qwords;
+                ix.wq_b.qscales = pq.qscales;
+                ix.wq_b.qfp8 = pq.fp8;
+            }
         }
         L.wk = try depadWk(d, stream, at.wk, at.heads, nope, lw, at.qk, &w, stats);
         w.layers[i] = L;

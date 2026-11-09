@@ -609,6 +609,7 @@ pub const State = struct {
         v.view = true;
         v.mem = .empty;
         v.slots = 1;
+        // §128.27az: the pool's per-slot INTERVALS (null: the uniform stride, bit-identical)
         const row0: usize = if (s.slot_start) |o| o[slot] else slot * s.local;
         const rows_i: usize = if (s.slot_rows) |r| r[slot] else s.local;
         const lat0 = row0 * s.lat_row;
@@ -708,6 +709,8 @@ pub const State = struct {
         const starts = s.slot_start orelse return error.Invalid;
         const lens = s.slot_rows orelse return error.Invalid;
         if (slot >= lens.len or lens[slot] != 0 or rows == 0 or start + rows > s.local) return error.Invalid;
+        // §128.27hk THE POOL INSTRUMENT: TF_GLM53_POOL_LOG=1 - every claim/release/reconcile on rank 0,
+        // the ledger diffed against the expected first-fit at the reproducer (the Mia class s seat hunt).
         if (std.c.getenv("TF_GLM53_POOL_LOG") != null and !@import("builtin").is_test) {
             std.log.info("pool: claim slot={d} start={d} rows={d} (plane local={d})", .{ slot, start, rows, s.local });
         }
@@ -1191,6 +1194,9 @@ pub const Forward = struct {
     /// smalls - the DECODE windows only (R <= 64; the prompt windows keep cuBLAS); null: cuBLAS.
     qlane: ?*const cuda.qmmf.Lane = null,
     qpart: u64 = 0,
+    /// TF_GLM53_HEAD_FP8: the head's own qmmf part scratch (the engine's hqpart). The fp8 branch
+    /// of headLogits refuses — falls to the bf16 router — when this is 0.
+    hpart8: u64 = 0,
     /// 125.43(d) the mode-conditional dispatch cell: the verify window's pick (argmax: greedy ->
     /// the lane; local: sampled -> cuBLAS). Set by the VerifyCtx at the CAPTURE (the pick is a graph
     /// key - each pick's captures freeze its branch; the replays never read it). Null: the legacy
@@ -1725,6 +1731,9 @@ pub const Forward = struct {
                     const pdq = try f.pbegin();
                     const lc = try v.dequantShard(f, kc, pos, R);
                     try f.pend(pdq, .kv8_dequant);
+                    // §128.27ds THE PSCRATCH CHECKSUM (the bypass instrument): what the attention CONSUMES,
+                    // slot 0 vs slot 1 at the same prompt - identical expected; a diff indicts the mirror or
+                    // the collective's terms. Layer 0 only, the first real prefill only (wdebug off at capture).
                     if (wdebug_on and L.index == 0 and R >= 8) {
                         const o3 = kern.Ops{ .k = f.k, .s = f.s };
                         var hb: [1200]u8 = undefined;
@@ -1827,6 +1836,9 @@ pub const Forward = struct {
             if (wdbg) {
                 try f.s.synchronize();
                 std.log.info("wdebug: layer {d}", .{li});
+                // §128.27du THE LAYER-0 OUTPUT CHECKSUM (the bisect from the top): the hidden rows after
+                // layer 0's full compute, slot 0 vs slot 1 at the same prompt - the diff, if any, is the
+                // corruption's fingerprint (parity-swapped / shifted / foreign / scaled).
                 if (li == 0 and R >= 2) {
                     var hb: [12288]u8 = undefined;
                     const D2 = D * 2;
@@ -1876,9 +1888,9 @@ pub const Forward = struct {
         const V = f.w.vocab_part;
         switch (mode) {
             .none => return,
-            .local => return headLogits(f.w, t_, o, b.fnormed, b.lg, b.hpart, b.hxh, n),
+            .local => return headLogits(f.w, t_, o, b.fnormed, b.lg, b.hpart, b.hxh, n, f.qlane, f.hpart8),
             .argmax => {
-                try headLogits(f.w, t_, o, b.fnormed, b.lg, b.hpart, b.hxh, n);
+                try headLogits(f.w, t_, o, b.fnormed, b.lg, b.hpart, b.hxh, n, f.qlane, f.hpart8);
                 try o.argmaxRec(b.lg, V, V, 0, f.w.vocab_off, b.amax, n);
             },
             .draft => {
@@ -2337,7 +2349,7 @@ pub const Forward = struct {
         const t_ = f.t();
         const o = f.ops();
         try t_.rmsnorm(b.x + (R - 1) * D * 2, D, f.w.final_norm, b.fnormed, D, 1, D, c.eps);
-        try headLogits(f.w, t_, o, b.fnormed, b.lg, b.hpart, b.hxh, 1);
+        try headLogits(f.w, t_, o, b.fnormed, b.lg, b.hpart, b.hxh, 1, f.qlane, f.hpart8);
         try o.download(std.mem.sliceAsBytes(host[0..V]), b.lg);
         try f.s.synchronize();
         const i = argmaxFirst(host[0..V]);
@@ -2477,7 +2489,7 @@ pub const Forward = struct {
 /// and linear_kernel, as every dense EXL3 linear - and the share copied out of its result. `scratch`: the router's
 /// partials, or the launch's result fp32 [n, blocks * 128]; `xh`: fp16 [n, D] (a quantized head alone). Each row is
 /// computed alone on both paths.
-pub fn headLogits(w: *const W.Weights, t_: tri.Tri, o: kern.Ops, x: u64, lg: u64, scratch: u64, xh: u64, n: usize) !void {
+pub fn headLogits(w: *const W.Weights, t_: tri.Tri, o: kern.Ops, x: u64, lg: u64, scratch: u64, xh: u64, n: usize, q: ?*const cuda.qmmf.Lane, part: u64) !void {
     const D = w.config.hidden;
     const V = w.vocab_part;
     if (w.head_q) |*hq| {
@@ -2485,6 +2497,20 @@ pub fn headLogits(w: *const W.Weights, t_: tri.Tri, o: kern.Ops, x: u64, lg: u64
         const sc: kern.LinearScratch = .{ .xh = .{ xh, 0, 0 }, .z = .{ 0, 0, 0 }, .xh_bytes = n * D * 2, .z_bytes = 0 };
         try o.linear(&hq.lin, x, .bf16, scratch, .f32, n, sc);
         return o.copyRows(lg, V * 4, scratch + hq.off * 4, hq.lin.n * 4, V * 4, n);
+    }
+    // TF_GLM53_HEAD_FP8 (off by default): the head's quantized-compute read — the canary's .fp8g
+    // launch (the smalls' proven kernel at the head's shape: the fp8 codes + the 128-block scales,
+    // half the bf16 weight read a head call). The decode/verify windows only (n <= 64, the dense
+    // lane's proven row class); the wider prompt passes keep the bf16 router. A NEW NUMERIC LANE:
+    // the numerics move bytes — the fresh-anchor re-roll gates at the window (§125.38's class).
+    if (w.head_fp8) |hq| {
+        if (q) |lane| {
+            if (part != 0 and n <= 64) {
+                const qw = cuda.qmmf.Weight{ .mode = .fp8g, .codes = hq.codes, .scales = hq.scales,
+                    .n = @intCast(V), .k = @intCast(D), .npad = hq.npad };
+                return lane.matmulOut(t_.s, x, D, n, qw, lg, .f32, part);
+            }
+        }
     }
     return t_.router(x, D, w.lm_head, lg, scratch, n, D, V);
 }

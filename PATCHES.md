@@ -39,16 +39,19 @@ The **Travels** column is the upstreamability tag:
 | 8 | The resume/keeps machinery | the tail-recompute form: a grown conversation resumes from the kept prefix, re-computing the tail for exact bits (see README: known issues for its trade) | OURS-FAMILY |
 | 9 | The bucket + null-rung graph trims | the decode-graph set bounded for the 600K envelope; the shallow capture-transition anomaly trimmed | ENGINE-PATTERN |
 | 10 | The drafter config class | the adaptive dspark drafter pinned: depth 8, confidence floor 0.20, the MTP layers off (the receipted sweep's winners) | OURS-FAMILY |
-| 11 | The libtfgrammar structured-output port | **in-tree, PARKED**: grammar-masked token picks end-to-end at the library level, pending one mid-round collective (see README: known issues). Not in the shipped binary. | CAMPAIGN-INTERNAL |
-| 12 | The debug instruments | env-gated and off by default: the pool logging, the round dump, the profilers. The parked port's stage-mark logging (item 11) is unconditional but only reachable on the structured path — it retires when the port resumes. | CAMPAIGN-INTERNAL |
+| 11 | The libtfgrammar structured-output port | the server half (`response_format`/`guided_*` → the compiled Spec, the compiler handoff, `tool_choice` required/named) and the lane core (the grammar walk, the per-round mask pool, the admit first-mask) — the `structures` gate opens on the family's `first_masked` | OURS-FAMILY |
+| 12 | The pre-take protocol | the masked pick and the commit's validation share ONE matcher transition (the hook pre-takes the gathered pick, the commit consumes — the disagreement class dead by construction) | OURS-FAMILY |
+| 13 | The RoCE-safe masked-pick gather | `grammar_pick.zig`: the host seat (the masked argmax, the record with the live flag, the rank-reduce — pickRank's rule) with the records over the RENDEZVOUS channel (host TCP, rank-0-mediated, bit-identical on every rank) — NO eager GPU-side collective mid-round; the dead-grammar verdict is collective | OURS-FAMILY |
+| 14 | The exchange + keep fixes | the rendezvous allGather's size contract held by construction (the world-sized slice) with a loud failure log; the advisory `keep` made the no-op it always was (the commit IS the keep); per-stream GrammarDead isolation (the guilty stream dies alone, the round continues for its mates); the round-fail path takes the round's own streams, sparing the queued, the not-yet-started, and the already-finished | OURS-FAMILY |
+| 15 | The debug instruments | env-gated and off by default: the pool logging, the round dump, the profilers; the structured path's own marks (maskPicks per item, the once-only rendezvous mark) are its observability | CAMPAIGN-INTERNAL |
 
 ## The image manifest (`ghcr.io/ciprianveg/gb10-tensorfold`)
 
 | Layer | Content |
 |---|---|
 | The base container | the proven GB10 runtime: Ubuntu 24.04, the CUDA/NCCL/RoCE userspace, the python HTTP environment the serve containers have run in production (`base-glm53-fp8-final`) |
-| `tensorfold-native` | the campaign's **(c)-form binary class** (`74039aa42dba…`) — the free-form-proven form: the base + items 1-10 above, WITHOUT the parked port. Built from this tree at the pre-port source state. |
-| `libtfgrammar.so` | present, dlopen'd lazily beside the binary; the structured-output lane it serves is parked — free-form serving never loads it |
+| `tensorfold-native` | the **structured-landed binary class** (`c5cef43b…`) — the base + items 1-14 above with the structured-output lane armed, plus the default-OFF fp8 experiment arms (see CHANGELOG v1.0.2/v1.0.3; the standing ruling: the head and the shared experts remain bf16). Built from this tree; free-form bits unchanged, anchors-gated. |
+| `libtfgrammar.so` | present, dlopen'd lazily beside the binary at the first structured request — free-form serving never loads it |
 | `tensorfold-serve` | the entry wrapper (`deploy/tensorfold-serve`, tracked here) |
 
 Path-mounted at boot (not in the image — see `start.sh`): the model pack

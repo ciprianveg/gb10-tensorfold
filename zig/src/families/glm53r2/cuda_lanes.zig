@@ -230,6 +230,8 @@ pub const Adapter = struct {
         const ms = b.mu.find(b.sids[slot]) orelse return error.UnknownStream;
         if (ms.mode == .mtp) return error.Glm53MtpArmsAreV2FollowUp; // the k=0 scope cut
         const P: u64 = w.positions[0];
+        // §128.27am THE SYNC-FROM-WINDOW: the lane core is the authority - its positions/pending are the
+        // truth (the familyRound's skipped keeps made the assert class fail); the adapter mirrors.
         ms.P = @intCast(P);
         ms.tok = w.pending;
         const arm: u32 = if (ms.mode == .serial) multi.arm_none else multi.arm_draft;

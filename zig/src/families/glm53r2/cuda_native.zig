@@ -160,6 +160,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         ad.mode = if (boot.o.mode) |m| multi.modeOf(std.meta.stringToEnum(rn.Mode, m) orelse .dspark) else .dspark; // §128.27ew the engine's draft mode (the env string parsed; dspark the unset default, the prior behavior)
         adapter = ad;
         own.adapter = ad;
+        // §128.27hz+++++++++++++++++++ THE IDLE HEARTBEAT (the workers' exit class, the 121st): the
+        // wire speaks only within requests, an idle leader sends nothing, and the followers' 600 s
+        // recv timeout (rendezvous.broadcast's recvAll) expires them all out - the clean exit(0),
+        // "following rank 0 ended (Timeout)", the tool-bench's headless 9. The leader's heartbeat
+        // thread speaks a no-op every 240 s under the wire mutex; the 600 s guard ITSELF stays (a
+        // truly dead leader still frees the workers within 10 min).
         if (opts.rank == 0 and boot.rdv.world > 1) {
             if (std.Thread.spawn(.{}, heartbeatLoop, .{ad})) |t| t.detach() else |_| {}
         }
@@ -172,9 +178,20 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         std.process.exit(0);
     }
     return .{
+        // §128.27cy THE ADAPTER: the multi form rides the framework's Engine through a real Backend
+        // (verify/draft/keep/prefill/release over the Multi); the lone form keeps the refusing stubs.
         .backend = if (adapter) |ad| .{ .ptr = ad, .vtable = &adapter_vtable } else .{ .ptr = own, .vtable = &vtable },
         .facts = if (boot.multi != null)
             .{ .mtp = true, .drafts = @as(u32, 7), .exact_width = @intCast(fw.decode_rows), .copy_drafts = false, .speculate = true, .speculate_early = false, .hidden_rows = true, .batch_rows = @intCast(fw.decode_rows), .max_streams = multi.max_streams,
+            // §128.27eq THE STARVATION FIX (adopt-don't-reinvent): the family's MEASURED round wall,
+            // declared on upstream's own surface (config.zig's window_costs -> family_costs, the exact
+            // table depth.zig's priced walk reads). Without it family_costs is empty and depth()'s
+            // fallback caps the ask at 1 (want=1 at p[0]<0.8) — the lone's draft starvation (97% of
+            // rounds <=1 accepted, ~1.14 offered despite room 7). With the flat wall declared (the
+            // campaign's receipts: ~78 ms plain, ~86-93 ms by width 2-8 — the R-dependence modest),
+            // the priced walk derives the ask from the real economics and the adaptive feedback
+            // (observeDepth/observeCost) re-learns from live rounds. Never a clamp, never new
+            // economics: the same surface every costing family declares.
             .draft_prior = &.{ 0.634, 0.495, 0.438, 0.387, 0.300, 0.250 }, // 128.27fn THE TRUE MARGINALS (128.27fo: the dlog s kept/tried, the fit tool s own semantics: d0-d3 the raw 170/268, 93/188, 39/89, 12/31; d4-d5 the small-sample-conservative trend) - the Rule s priced search runs on the measured profile, not the class defaults (the LEARN-WITHOUT-FEED class s static remedy; the live observe-wiring priced behind)
             .window_costs = &.{
                 .{ .width = 1, .ms = 78.0 }, .{ .width = 2, .ms = 86.0 }, .{ .width = 3, .ms = 88.0 },
@@ -250,6 +267,9 @@ fn followerV2(own: *Owned) !void {
                 .shutdown => return,
                 .keep => return error.OutOfStep, // a keep never arrives at the loop's top: only inside a round
                 .finish => mu.finish(msg.sid),
+                // §128.27hz++++++++++++++++++++ THE FOLLOWER'S FILL VISIBILITY: the silent early
+                // return (OutOfStep on a queue/plan mismatch) was invisible — the wedge hunt blind
+                // on the followers' side. The error named before it kills the loop.
                 .fill => _ = mu.applyFill(msg.sid) catch |e| {
                     std.log.err("follow: fill sid={d} failed at rank {d}: {s}", .{ msg.sid, mu.w.rank, @errorName(e) });
                     return e;
@@ -260,17 +280,39 @@ fn followerV2(own: *Owned) !void {
                     try own.boot.rdv.broadcast(std.mem.sliceAsBytes(ids));
                     var aw: V2Admit = undefined;
                     try own.boot.rdv.broadcast(std.mem.asBytes(&aw));
+                    // §128.27hz++++++++++++++++++++++++++++++ THE FIRST MASK'S RECEIVING HALF: the
+                    // words follow the admit struct, in wire order — the followers' fill replays
+                    // the SAME masked first pick (the pick's gather is a collective; a follower
+                    // without the mask would answer it with an unmasked record). The admit dupes;
+                    // this copy frees at the arm's end.
                     var gmask: ?[]u32 = null;
                     defer if (gmask) |m| a.free(m);
                     if (aw.has_grammar != 0) {
                         gmask = try a.alloc(u32, aw.grammar_words);
                         try own.boot.rdv.broadcast(std.mem.sliceAsBytes(gmask.?));
                     }
+                    // §128.27hv THE POOLFULL FATALITY FIX (the wedge s exact line, 128.27hu: "rank 1:
+                    // following rank 0 ended (PoolFull)" - the too-large claim at the plane s edge killed
+                    // the ENGINE instead of refusing the request): the admission-class errors are
+                    // REQUEST-CLASS refusals, never engine fatals. Caught symmetrically on every rank -
+                    // the ledger deterministic, the same failure everywhere, the stream uncreated alike -
+                    // the coherence intact, the loop lives, the request s own reply path surfaces the
+                    // refusal. The collective-class errors stay fatal (the wire s true failures).
+                    // §128.27hz+++++++++++ THE FOLLOWERS' REPLAY: the begin and the keeps from the
+                    // wire (the leader's authority), the stops recomputed deterministically from the
+                    // mirrored plan over the same prompt — every rank admits the SAME resume or the
+                    // resumed leader diverges from the filling followers (the hang class born).
                     const sampling: ?smp.Sampling = if (aw.has_sampling != 0) .{
                         .seed = aw.seed, .temperature = aw.temperature, .top_k = aw.top_k, .top_p = aw.top_p, .min_p = aw.min_p,
                     } else null;
                     var stops_list: std.ArrayList(usize) = .empty;
                     defer stops_list.deinit(a);
+                    // §128.27hz++++++++++++++++ THE ONE-LINE FIX: the recompute runs UNCONDITIONALLY —
+                    // the leader's stops flow at begin=0 too (cutAndKeep always computes them); the
+                    // old `begin != 0` gate left the followers on the plain even plan (73 chunks at
+                    // step 4075) against the leader's stop-split plan (74, the first [0,4096)) — the
+                    // first chunk's rows already differed, the DCP collectives desynced inside chunk
+                    // zero, both sides waited forever (the receipt: ci=0/74 printed once, the 600s hang).
                     {
                         const pts = try mu.plan_rz.points(a, ids);
                         defer a.free(pts);
@@ -278,7 +320,10 @@ fn followerV2(own: *Owned) !void {
                     }
                     _ = mu.admit(.{ .sid = msg.sid, .slot = aw.slot, .mode = @enumFromInt(aw.mode), .sampling = sampling, .count = aw.count, .prompt = ids,
                         .begin = aw.begin, .stops = stops_list.items, .keeps = aw.keeps[0..@min(aw.keeps_n, 4)],
+                        // §128.27hz++++++++++++++++++++++++++++++ the first mask (the admit dupes)
                         .gmask = gmask,
+                        // §128.27hz+++++++++++++++++++++ THE RESUME'S SOURCE REPLAYED (the 1195
+                        // receipt's fix): the followers' namedIn looks where the leader's rows are.
                         .src = if (aw.has_src != 0) aw.src else null }) catch |e| switch (e) {
                         error.PoolFull, error.NoFreeSlot, error.PromptTooLong => {},
                         else => return e,
@@ -289,20 +334,32 @@ fn followerV2(own: *Owned) !void {
                     defer a.free(words);
                     try own.boot.rdv.broadcast(std.mem.sliceAsBytes(words));
                     const plan = try multi.Plan.decode(words);
+                    // §128.27hz++++++++++++++++++++++++++++++++ the wedge hunt's instrument: the
+                    // decoded plan's grammar fields (the wire's truth vs the leader's compute)
                     {
                         var gs: [multi.max_streams]u32 = @splat(0);
                         for (plan.items[0..plan.n], 0..) |it, i| gs[i] = it.grammar;
                         std.log.info("follower: round-entry n={d} grammars={any}", .{ plan.n, gs[0..plan.n] });
                     }
+                    // §128.27ao THE NO-KEEP WIRE: the collectives meet (gpu's forward + picks'
+                    // gather) and the picks are a collective - every rank's res is bit-identical by
+                    // construction - so the follower commits with its OWN picks and the lead's keep
+                    // broadcast is gone with the adapter (the two-authority class dead by design).
                     var t = try mu.gpu(&plan);
                     std.log.info("follower: post-gpu", .{}); // §128.27hz the wedge hunt's stage marks
                     var fres: [multi.max_streams]multi.Result = undefined;
                     try mu.picks(&plan, &t, &fres, null);
                     std.log.info("follower: post-picks", .{}); // §128.27hz
+                    // §128.27hz++++++++++++++++++++++++++++++ THE GRAMMAR ROUNDS' HOOK (the
+                    // follower's half): the masks decoded from this round's message — the re-draw
+                    // under them a collective, every rank at the same point, the res bit-identical
+                    // to the leader's by construction (the §128.27ao property held)
                     try mu.maskPicks(&plan, &t, &fres, null);
                     std.log.info("follower: post-maskPicks", .{}); // §128.27hz the wedge hunt's stage marks
                     try mu.commit(&plan, &t, &fres);
                     std.log.info("follower: post-commit", .{}); // §128.27hz
+                    // §128.27am: the sync FROM THE PLAN ITEMS - rank 0's truth in every round message
+                    // (the plan carries the state)
                     for (plan.items[0..plan.n]) |it| {
                         const s2 = mu.find(it.sid) orelse return error.OutOfStep;
                         s2.P = it.P;
@@ -310,6 +367,9 @@ fn followerV2(own: *Owned) !void {
                         s2.m = it.m;
                     }
                 },
+                // §128.27hz+++++++++++++++++++ THE IDLE HEARTBEAT'S RECEIVING HALF: a no-op from the
+                // leader's heartbeat thread - nothing to do but loop, which is the whole point (the
+                // recvAll restarts with a fresh 600 s, the idle timeout never fires on a healthy leader).
                 .heartbeat => {},
             }
             continue;
@@ -433,6 +493,9 @@ fn toOur(s: ?lanes.Sampling) ?smp.Sampling {
 const Adapter = struct {
     gpa: std.mem.Allocator,
     mu: *multi.Multi,
+    // §128.27ew THE MODE ROUTED (the audit's dead knob, live): the engine's draft mode
+    // (TF_GLM53_MTP -> boot.o.mode), mapped by the era's own multi.modeOf — the adapter
+    // hardcoded .dspark before (the §128.27ev audit's line-tied verdict).
     mode: multi.Mode = .dspark,
     rdv: ?*cuda.rendezvous.Rendezvous = null,
     owners: [multi.max_streams]?*AOwner = @splat(null),
@@ -535,6 +598,10 @@ const Adapter = struct {
         const d: *Adapter = @ptrCast(@alignCast(p));
         const ids = s.prompt();
         if (ids.len == 0) return error.PromptTooLong;
+        // §128.27hz++++++++++++++++++++++++++++++ THE PORT'S V1 GATE: structured output is
+        // GREEDY-ONLY — the masked pick is the row's best allowed token (argmaxRec's rule); a
+        // sampled draw under a mask is the v2 seam (xpu_lanes' sampled masked form). Refused
+        // BEFORE any state mutates (the owner uncreated, nothing on the wire).
         if (s.grammar != null and seam.toOur(s.sampling) != null) return error.StructuresNeedGreedy;
         // THE WHOLE PREFILL UNDER THE WIRE MUTEX (the Flash Next sid-race form: the lock BEFORE
         // next_sid is read) — and the fill's queue-head guarantee in one: no other prefill can take
@@ -543,11 +610,21 @@ const Adapter = struct {
         d.wire.lockUncancelable(d.io);
         defer d.wire.unlock(d.io);
         const c = try d.mu.choose(ids, true); // the SlotReuse + the pool's admission
+        // §128.27hz++ THE RESUME FLAG RAISED (the multi-turn starvation's line): choose's prefix
+        // match was gated behind resume_=true and NO caller ever passed true — the chat path's
+        // every turn arrived as a brand-new conversation: cached=0 forever, the next turn
+        // re-read the whole history (the 297K audit: turn 2 = 344.7s, the full re-read, the
+        // stride's interior points present and never consulted). The match itself is
+        // TOKEN-VERIFIED (Store.best: std.mem.eql against the kept ids) — a hit is a genuine
+        // shared prefix; cutAndKeep(true) also records the keeps so the NEXT turn hits in turn.
         defer c.deinit(d.gpa);
         const o = try d.gpa.create(AOwner);
         errdefer d.gpa.destroy(o);
         const sid = d.next_sid;
         const sm = toOur(s.sampling);
+        // §128.27hz++++++++++++++++++++++++++++++ THE STRUCTURED ARM: a grammar's stream runs
+        // SERIAL — no drafts (every drafted row would need the walk's mask; the v1's exact form
+        // takes the one masked pick a round, the walk synced by the engine's own accepts)
         const a_mode: multi.Mode = if (s.drafts and s.grammar == null) d.mode else .serial; // §128.27ew the routed mode (was: hardcoded .dspark)
         // ...AND THE LANE-SIDE TWIN: the ENGINE must hold no drafts either — windows.zig's
         // constrain() reads the held drafts through backend.held (the v2 seam, unimplemented
@@ -555,6 +632,12 @@ const Adapter = struct {
         // row, the grammar's walk the pending alone, the HeldDraftsUnreadable class dead.
         if (s.grammar != null) s.drafts = false;
         const a_count: usize = @max(1, s.max_new);
+        // §128.27hz++++++++++++++++++++++++++++++ THE FIRST TOKEN'S MASK: the walk's root fill —
+        // prompt-independent, so it rides the admit once (the followers' fill replays the SAME
+        // masked first pick; the pick's gather is a collective, never deserted). The engine's own
+        // drawFirst computes the identical bits (the same walk object, the same root state) —
+        // first_masked returns the pending the fill already drew. next() is pure: nothing advances.
+        // Computed at the fn's scope: the admit's dupe needs it with or without the wire.
         var gmask0: ?[]u32 = null;
         defer if (gmask0) |m| d.gpa.free(m);
         if (s.grammar) |g| gmask0 = try g.next(d.gpa);
@@ -575,6 +658,8 @@ const Adapter = struct {
                 .top_k = if (sm) |x| @intCast(x.top_k) else 0,
                 .top_p = if (sm) |x| @floatCast(x.top_p) else 0,
                 .min_p = if (sm) |x| @floatCast(x.min_p) else 0,
+                // §128.27hz+++++++++++ THE RESUME ON THE WIRE: the begin and the keeps flow to the
+                // followers (the stops recompute per rank from the mirrored plan)
                 .begin = @intCast(c.begin),
                 .keeps_n = @intCast(@min(c.keeps.len, 4)),
                 .keeps = blk: {
@@ -582,8 +667,13 @@ const Adapter = struct {
                     for (c.keeps[0..@min(c.keeps.len, 4)], 0..) |k, i| buf[i] = k;
                     break :blk buf;
                 },
+                // §128.27hz+++++++++++++++++++++ THE RESUME'S SOURCE ON THE WIRE (the 1195 receipt's
+                // fix): the busy-else branch's c.src — without it the followers looked in their own
+                // fresh slot and died ReuseOutOfStep while the leader resumed from the busy one.
                 .has_src = @intFromBool(c.src != null),
                 .src = @intCast(c.src orelse 0),
+                // §128.27hz++++++++++++++++++++++++++++++ the first mask's wire flag: the words
+                // follow this struct as their own broadcast (the followers' fill needs them)
                 .has_grammar = @intFromBool(gmask0 != null),
                 .grammar_words = @intCast(if (gmask0) |m| m.len else 0),
             };
@@ -592,8 +682,20 @@ const Adapter = struct {
         }
         o.* = .{ .lane = s, .sid = sid, .slot = c.slot, .held_i = c.slot };
         _ = d.mu.admit(.{ .sid = sid, .slot = c.slot, .mode = a_mode, .sampling = sm, .count = a_count, .prompt = ids, .eos = s.eos,
+                // §128.27hz+++++++++++ THE FIX AT THE NAMED SEAT: the Choice's begin/stops/keeps
+                // PASSED (they were computed at choose and discarded here — the interior entries
+                // never created, the exact-repeat's hit advisory, the leader itself re-filling)
                 .begin = c.begin, .stops = c.stops, .keeps = c.keeps, .src = c.src,
+                // §128.27hz++++++++++++++++++++++++++++++ the first mask (the admit dupes; the
+                // leader's copy freed at this fn's end)
                 .gmask = gmask0 }) catch |e| switch (e) {
+            // §128.27hz+ THE LEADER'S MIRROR OF THE 128.27hv CATCH: with the claim-path coherence
+            // gate (the dry-run hole — a refusal mutates NO ledger state), a request-class refusal
+            // is SYMMETRIC: the deterministic ledger refuses the same claim on every rank, the
+            // followers' wire loop catches it alike (the 128.27hv arm below), no stream created,
+            // nothing mutated — the world is NOT out of step. Marking it broken wedged every later
+            // request (the 49K receipt at the DCP1-P4-POOL: PoolFull -> broken -> even the
+            // 13-token alive-probe died RanksOutOfStep). The collective-class errors stay fatal.
             error.PoolFull, error.NoFreeSlot, error.PromptTooLong => return e, // the errdefer frees the owner; the reply path surfaces the refusal
             else => {
                 d.mu.broken = d.mu.world > 1;
@@ -630,10 +732,15 @@ const Adapter = struct {
         const g0 = mu.r.graph_runs; // §128.27en the split: this round's replay-or-miss delta
         const e0 = mu.r.eager_runs;
         var plan: multi.Plan = .{};
+        // §128.27hz++++++++++++++++++++++++++++++ THE ROUND MASKS' HOME: borrowed by the plan (the
+        // encode and the hook read them), freed at this verify's end — the leader owns the walk,
+        // the masks distribute, no second walk anywhere
         var gmasks: [multi.max_streams]?[]u32 = @splat(null);
         defer {
             for (gmasks) |m| if (m) |x| d.gpa.free(x);
         }
+        // §128.27hz++++++++++++++++++++++++++++++++++++ the pre-take protocol's per-round
+        // constraints (the leader's walks, stashed at the mask compute for the post-hook take)
         var gcons: [multi.max_streams]?*lanes.grammar.Constraint = @splat(null);
         var n_live: usize = 0;
         for (mu.streams.items) |x| n_live += @intFromBool(!x.done);
@@ -654,6 +761,11 @@ const Adapter = struct {
             const cap: usize = if (multi.drafterOf(ms.mode)) |which| mu.depthOf(which, n_live) else 0;
             const room: usize = if (arm == multi.arm_none) 0 else @min(held, cap);
             plan.items[plan.n] = .{ .sid = o.sid, .slot = @intCast(ms.slot), .P = @intCast(ms.P), .tok = ms.tok, .m = @intCast(ms.m), .mode = @backingInt(ms.mode), .arm = arm, .room = @intCast(room), .sampled = @intFromBool(ms.sampling != null) };
+            // §128.27hz++++++++++++++++++++++++++++++ THE WALK'S MASK FOR THIS ROUND: the engine's
+            // own walk (the first token committed at the draw site, the rounds' tokens at the
+            // verify's tail — the accepts always between rounds), next() pure — the current
+            // state's fill, nothing advanced here. A finished grammar masks nothing (the free
+            // tail rides the plain records).
             if (o.lane.grammar) |g| {
                 if (try g.next(d.gpa)) |m| {
                     plan.items[plan.n].grammar = @intCast(m.len);
@@ -661,6 +773,8 @@ const Adapter = struct {
                     gmasks[plan.n] = m;
                     gcons[plan.n] = g;
                 }
+                // §128.27hz++++++++++++++++++++++++++++++++ the wedge hunt's instrument: the
+                // mask compute's outcome per item (the plan's grammar field the followers mirror)
                 std.log.info("adapter: mask-compute sid={d} grammar={d} active={}", .{ o.sid, plan.items[plan.n].grammar, g.active });
             }
             plan.n += 1;
@@ -699,10 +813,23 @@ const Adapter = struct {
         std.log.info("adapter: pre-picks n={d}", .{plan.n}); // §128.27hz the wedge hunt's stage marks
         try mu.picks(&plan, &t, &d.res_buf, &d.rows_buf);
         std.log.info("adapter: post-picks", .{});
+        // §128.27hz++++++++++++++++++++++++++++++ THE GRAMMAR ROUNDS' HOOK (the leader's half): the
+        // re-draw under the plan's own masks, BEFORE the padding loop (the engine's sampled view
+        // reads rows_buf — the walk must accept the MASKED token, never the unmasked record) and
+        // before the commit. The followers run the same hook at the same point (their masks
+        // decoded from this round's message): the re-draw's gather a collective, the res
+        // bit-identical on every rank by construction.
         try mu.maskPicks(&plan, &t, &d.res_buf, &d.rows_buf);
         std.log.info("adapter: post-maskPicks", .{}); // §128.27hz the wedge hunt's stage marks
+        // §128.27hz++++++++++++++++++++++++++++++++++++ THE PRE-TAKE (the two-truths redesign):
+        // the gathered pick taken on the walk ITSELF — the pick and the commit's validation one
+        // transition, the follow's consumption without a second matcher call. The leader only
+        // (the followers hold no walk; their res is the collective's bit-identical copy). A
+        // refusal is the honest error at the pick's own site — the walk rejecting its own fill's
+        // token, the receipted class, never a mid-commit surprise.
         for (plan.items[0..plan.n], 0..) |it, i| {
             if (it.grammar == 0) continue;
+            if (ss[i].failed != null) continue; // §the isolation: a dead stream's pick is moot, its walk never consumes
             const g = gcons[i] orelse return error.OutOfStep;
             if (!try g.preTake(d.res_buf[i].emit[0])) return error.WalkRefusedMaskedPick;
         }
@@ -737,9 +864,12 @@ const Adapter = struct {
         mu.rounds += 1;
         for (plan.items[0..plan.n], 0..) |it, i| {
             const s = ss[i];
+            if (s.failed != null) continue; // §the isolation: the dead stream's state freezes, identically on every rank
             const x = &d.res_buf[i];
             s.rounds += 1;
             s.drafted += t.ds[i];
+            // §128.27en the instruments: the round's split (one replay-or-miss per shared round,
+            // credited to every stream in it) and the accepted-length histogram (0/1/2/3+).
             s.graph_runs += mu.r.graph_runs - g0;
             s.eager_runs += mu.r.eager_runs - e0;
             s.chain[@min(x.n, 3)] += 1;
@@ -748,21 +878,25 @@ const Adapter = struct {
             s.tok = x.emit[x.len - 1];
             s.m = x.n + 1;
             d.ds_buf[i] = t.ds[i];
+            // §128.27ew the dlog's round close ON THE V2 PATH (the emission rode applyRound,
+            // never called here — the stash never emitted, the calibration's input dead):
+            // the same expression applyRound passes (the py contract: emit[0] at the tree's position).
             if (mu.dlog) |dl| dl.round(it.sid, it.slot, x.emit[0..x.len]);
         }
         std.log.info("adapter: round-done n={d}", .{plan.n});
     }
 
-    /// keep(): the deliberate no-op — the commit IS the keep (the no-keep wire). But a TREE or a
-    /// masked window is a form the no-keep never covered: refused LOUDLY, never a silent no-op.
-    fn aKeep(_: *anyopaque, windows: []const lanes.backend.Window, _: []const []const u32) anyerror!void {
-        for (windows) |w| {
-            if (w.parents != null or w.masks.len > 0) {
-                std.log.err("adapter: keep on a tree/masked window: the no-keep wire covers chains only", .{});
-                return error.Unsupported;
-            }
-        }
-    }
+    /// keep(): the deliberate no-op — the commit IS the keep (the no-keep wire). The window's FORM
+    /// is irrelevant to the answer: this backend never retains speculative rows — the accepted path
+    /// is committed (the keep's own work, as true of a masked round as of a plain one), and the
+    /// unaccepted remainder recomputes at the next draft (the fused propose re-drafts from the
+    /// committed state). §THE SECOND WINDOW'S RECEIPT (2026-11-09, the live bench): the loud
+    /// refusal here was over-cautious and fatal — the keep is ADVISORY, and refusing it turned a
+    /// benign "recompute" into error.Unsupported → the round failed → failAll murdered the innocent
+    /// round-mates (the bench's 80 vs the 86 baseline; eight deaths, TC-64 among them: its first
+    /// masked round SERVED, the keep at the next draft-entry killed it and its free-form partner).
+    /// The no-op for every form; nothing in this vtable entry is genuinely impossible.
+    fn aKeep(_: *anyopaque, _: []const lanes.backend.Window, _: []const []const u32) anyerror!void {}
 
     fn aDraft(p: *anyopaque, requests: []const lanes.backend.DraftRequest) anyerror!void {
         std.log.info("adapter: draft-entry", .{});
@@ -783,6 +917,10 @@ const Adapter = struct {
         d.wire.lockUncancelable(d.io);
         defer d.wire.unlock(d.io);
         const o = d.ownerOfLane(s) orelse return;
+        // §128.27eo THE INSTRUMENT (observability-only, token-neutral): the stream's own counters at
+        // release — the graph/eager split (a shared round's single replay-or-miss credited to every
+        // stream in it) and the accepted-length histogram (0/1/2/3+). The docker log's receipt,
+        // joinable to the done-lines by the sid's timing.
         if (d.mu.find(o.sid)) |ms| std.log.info("adapter: stream-done sid={d} rounds={d} g={d} e={d} c={d}/{d}/{d}/{d}", .{ o.sid, ms.rounds, ms.graph_runs, ms.eager_runs, ms.chain[0], ms.chain[1], ms.chain[2], ms.chain[3] });
         d.sendRaw(.finish, o.sid, 0) catch {};
         d.mu.finish(o.sid); // the pool's release
@@ -833,6 +971,8 @@ const Adapter = struct {
 const adapter_vtable = lanes.backend.Backend.VTable{
     .prefill = Adapter.aPrefill,
     .first = Adapter.aFirst,
+    // §128.27hz++++++++++++++++++++++++++++++ THE STRUCTURES GATE FLIPS: the entry's presence is
+    // the flag (cuda.zig:510 reads first_masked != null) — the request side flows, the 400s die
     .first_masked = Adapter.aFirstMasked,
     .queue = Adapter.aQueue,
     .read = Adapter.aRead,

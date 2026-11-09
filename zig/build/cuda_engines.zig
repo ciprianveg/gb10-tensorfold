@@ -79,7 +79,7 @@ fn canonModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 }
 
 /// GLM-5.3 (glm_moe_dsa) on CUDA from the NVFP4-CSF pack: its own family module (self-contained).
-fn glm53Cuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
+pub fn glm53Cuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
     const canon = canonModule(b, target, optimize);
     return b.createModule(.{ .root_source_file = b.path("zig/src/families/glm53_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{
         .{ .name = "cuda", .module = cuda },
@@ -90,7 +90,7 @@ fn glm53Cuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 
 /// GLM-5.3's r2 engine (families/glm53r2): r2's forward/prompt/decode/engine verbatim,
 /// with the 1.1 loader still the weights source. Its own module because r2's family compiles as a unit.
-fn glm53r2Cuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, glm53: *std.Build.Module, lanes_mod: *std.Build.Module) *std.Build.Module {
+pub fn glm53r2Cuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, glm53: *std.Build.Module, lanes_mod: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm53r2/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{
         .{ .name = "cuda", .module = cuda },
         .{ .name = "core", .module = core },

@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.0.3 — structured output landed
+
+**`response_format` (json_schema) and `tool_choice: "required"`/named are
+supported.** The grammar lane is real and verified: the server half
+(`response_format`/`guided_*` → the compiled Spec, the compiler handoff,
+the tool_choice-required enforcement), the lane core (the grammar walk, the
+per-round mask pool, the admit first-mask), and the RoCE-safe masked-pick
+gather — the records over the rendezvous channel, host-reduced,
+bit-identical on every rank; **no eager GPU-side collective mid-round**.
+The pre-take protocol holds the pick and the commit to ONE matcher
+transition. The library (libtfgrammar, xgrammar v0.2.8) ships in the image
+and lazy-loads at the first structured request — **free-form serving never
+loads it**, and free-form bits are byte-identical with the lane armed (the
+anchors gate receipts this at every boot).
+
+**The honest cost**: a masked round's token pick rides a host-side
+rendezvous exchange across the ranks (sub-millisecond per token typical; a
+fully-masked long generation pays it per token, per stream). Free-form
+rounds pay nothing.
+
+**The engine tree now corresponds to the shipped binary** (the `c5cef43b…`
+class): the zig/ tree is the source the binary was built from — the grammar
+lane (PATCHES items 11-14), both its fix cycles, and the inert fp8
+experiment arms (default OFF; the standing ruling: the head and the shared
+experts remain bf16).
+
 ## v1.0.2 — the pool-P4 default
 
 **The pool is the default.** `start.sh` now boots the measured-best form

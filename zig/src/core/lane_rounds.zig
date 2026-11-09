@@ -163,6 +163,9 @@ fn round(h: *LaneHost, rd: Rounds) bool {
     if (h.core.activeCount() > 0) {
         did = true;
         h.core.step() catch |e| {
+            // §128.27hz++++++++++++++++++++++++++++++++ THE BISECT INSTRUMENT (the Invalid hunt):
+            // the error named before the failRound swallows it (the aVerify's own seat lines
+            // localize the span; this catches the engine-side raises outside the adapter)
             std.log.err("lane core step failed ({s})", .{@errorName(e)});
             ends.failRound(h, e);
             return true;

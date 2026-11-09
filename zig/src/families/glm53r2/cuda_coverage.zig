@@ -138,10 +138,10 @@ fn window(t: tri.Tri, sp: Space, R: usize) !void {
             }
             const nch = @max(1, m.topk / tl.chk);
             for (0..dcp) |rank| {
-                try t.attnDcp(A, A, A, A, A, A, A, A, R, m, dcp, rank, tl, false, false);
+                try t.attnDcp(A, A, A, A, A, A, A, A, R, m, dcp, rank, tl, false, false, false);
                 if (nch == 1) {
-                    try t.attnDcp(A, A, A, A, A, A, A, A, R, m, dcp, rank, tl, true, false); // section 17: the fused single-chunk merge
-                    try t.attnDcp(A, A, A, A, A, A, A, A, R, m, dcp, rank, tl, true, true); // section 18: the e4m3 E1 wire (TF_GLM53_E1_FP8)
+                    try t.attnDcp(A, A, A, A, A, A, A, A, R, m, dcp, rank, tl, true, false, false); // section 17: the fused single-chunk merge
+                    try t.attnDcp(A, A, A, A, A, A, A, A, R, m, dcp, rank, tl, true, true, false); // section 18: the e4m3 E1 wire (TF_GLM53_E1_FP8)
                 }
                 try t.mergeLse(A, A, A, A, A, R, dcp, m, nch);
                 for ([_]bool{ true, false }) |small| {

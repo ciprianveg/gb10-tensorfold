@@ -64,8 +64,9 @@ link-bound stage; decode at these depths is link-insensitive).
 
 - ***JSON-output, not JSON-constrained*: the JSON column is free-form
   generation prompted to produce JSON (no grammar, no schema
-  enforcement); the grammar-constrained path is parked and contributes
-  nothing to these numbers.
+  enforcement); the structured-output lane is supported as of the
+  `c5cef43b` binary class (v1.0.3) and contributes nothing to these
+  rows — they were measured free-form.
 - ***: the c1-code class read **44–49 tok/s** across the day's clean runs
   (this form, this prompt); two late-session reads (39.2/42.0) fell under
   heavy disk contention on the master and are excluded from the range. The
@@ -137,10 +138,10 @@ link-bound stage; decode at these depths is link-insensitive).
   unwrapped: the `<tools>` JSON envelope, the `tool_to_json` rendering, and the
   `{{function-name}}` call format are the trained-on form.
 - **The exec-tool class: PASS, nothing to enable** — an execution-shaped tool renders and parses
-  like any function; the serve is pure client-side execution (the correct posture). One operator
-  note: **`tool_choice: "required"`/named → the clean 400** (the token-grammar enforcement — the
-  libtfgrammar lane — is ported but parked; see the parked-work note below; use `auto`, which
-  the probes show calls when appropriate).
+  like any function; the serve is pure client-side execution (the correct posture).
+  **`tool_choice: "required"`/named now serves** — the libtfgrammar lane landed in the v1.0.3
+  binary class (`c5cef43b`); the earlier clean-400 note is superseded. `auto` still calls when
+  appropriate.
 - **clear_thinking: accepted but INERT** — the kwarg validates and the render drops no prior
   reasoning. **The port is owed**: the render-side strip of prior turns' think blocks when the
   flag is on (the official card's explicit recommendation), priced ~0.5-1 day, byte-identical
@@ -148,13 +149,12 @@ link-bound stage; decode at these depths is link-insensitive).
 
 ## THE PARKED WORK AND THE PRICED REMAINDERS (the next-campaign menu)
 
-- **The structured-output port (libtfgrammar) — PARKED, in-tree, one resume step from done**: the
-  grammar-masked picks work end-to-end at the library level (the standalone harnesses exonerate
-  the walk: the root fill pure, the accepts consistent); the remaining seat is ONE collective —
-  the masked pick's 16-byte mid-round record gather (the fast oneshot times out; a raw NCCL op
-  wedges between graph replays). The designed fix: the records over the rendezvous channel
-  (host-reduced, bit-identical by construction). Until it lands, `tool_choice: required`/named
-  and json_schema enforcement stay the clean 400.
+- **The structured-output port (libtfgrammar) — LANDED (v1.0.3, the `c5cef43b` binary class)**:
+  the masked pick's gather rides the rendezvous channel (host-reduced, bit-identical on every
+  rank — no eager GPU-side collective mid-round), the pre-take holds the pick and the commit to
+  one matcher transition, the advisory keep is the no-op it always was, and a dead grammar ends
+  its stream alone. `response_format` (json_schema) and `tool_choice: required`/named serve;
+  free-form bits are unchanged (the anchors gate). The earlier parked note is superseded.
 - The refusal body's exact JSON (one line at the next pool boot — the status + the PoolFull
   reason receipted).
 - The dense-fp8 lever sized (the user's floor ruling: dense layers never below 8-bit — the

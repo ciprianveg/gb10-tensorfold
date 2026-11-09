@@ -92,6 +92,7 @@ test {
     _ = headq;
     _ = score;
     _ = score_cuda;
+    _ = @import("cuda_bind.zig"); // the binder: the fp8 canary (the RNE round-trip) + the head fp8 pack tests
 }
 
 // --- A1 transplant: the census, in executable form ------------------------------------------------------------

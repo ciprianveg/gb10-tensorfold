@@ -457,7 +457,10 @@ pub const Stream = struct {
                 if (!try g.follow(t)) {
                     s.finished = true;
                     s.reason = .@"error";
-                    std.log.err("walk rejected t={d} at landed={d} (of {d})", .{ t, landed, tokens.len });
+                    // §128.27hz++++++++++++++++++++++++++++++++ THE HUNT'S CONTEXT: which token,
+                    // how far in. Retired to warn with the fix (the transport): a per-request
+                    // diagnostic, not a process error.
+                    std.log.warn("walk rejected t={d} at landed={d} (of {d})", .{ t, landed, tokens.len });
                     s.problem = "the reply's grammar rejected a chosen token";
                     break;
                 }

@@ -223,6 +223,7 @@ pub const Plan = struct {
             const o = out[plan_head + i * item_words ..][0..item_words];
             o.* = .{ it.sid, it.slot, it.P, it.tok, it.m, it.mode, it.arm, it.room, it.sampled, it.grammar };
         }
+        // §128.27hz++++++++++++++++++++++++++++++ the masks pool: each structured item's words, item order
         var at = plan_head + p.n * item_words;
         for (p.masks[0..p.n]) |m| {
             if (m) |x| {
@@ -239,6 +240,8 @@ pub const Plan = struct {
         const items_end = plan_head + n * item_words;
         if (n > max_streams or words.len < items_end) return error.OutOfStep;
         var p: Plan = .{ .n = n, .cut = @bitCast(@as(u64, words[1]) | (@as(u64, words[2]) << 32)), .dcut = @bitCast(@as(u64, words[3]) | (@as(u64, words[4]) << 32)) };
+        // §128.27hz++++++++++++++++++++++++++++++ the masks pool: the trailing words, sliced per
+        // item by its grammar count, borrowed from `words` (the caller keeps them through commit)
         var at = items_end;
         for (0..n) |i| {
             const o = words[plan_head + i * item_words ..][0..item_words];
@@ -471,6 +474,14 @@ pub const Stream = struct {
     done: bool = false,
     eos_hit: bool = false,
     stopped: bool = false, // the hook asked
+    /// §THE PER-STREAM ISOLATION (the second window's receipt, 2026-11-09): the stream's own fatal
+    /// verdict — the dead grammar (GrammarDead, derived from the collective reduce over the same
+    /// gathered bytes, IDENTICAL on every rank: each rank marks its own copy, no wire needed). The
+    /// commit, the pre-take and the state advance skip a failed stream; its lane side dies alone at
+    /// the next token (the walk rejects everything at the dead position — Stream.commit's own
+    /// per-stream path), and the round continues for its mates. Only collectively-derivable
+    /// verdicts may set this; a leader-only decision would desynchronize the ranks.
+    failed: ?anyerror = null,
     rounds: usize = 0,
     drafted: usize = 0,
     accepted_n: usize = 0,
@@ -488,6 +499,7 @@ pub const Stream = struct {
     gap_ns: u64 = 0,
     graph_runs: u64 = 0,
     eager_runs: u64 = 0,
+    // §128.27eo the accepted-length histogram (the chain yield): per round, index @min(accepted, 3).
     chain: [4]u64 = @splat(0),
 
     fn isEnd(s: *const Stream, t: u32) bool {
@@ -929,6 +941,9 @@ pub const Multi = struct {
         const st = if (mu.store) |*x| x else return .{ .slot = free0 };
         const pts = try mu.plan_rz.points(mu.gpa, prompt);
         defer mu.gpa.free(pts);
+        // §128.27hz+++++++++ THE SEAT-NAMING INSTRUMENT: TF_REUSE_LOG - the store's FACTUAL state at
+        // the choose vs the code's intent (the contradiction: every condition read satisfied at the
+        // exact-repeat, yet cached=0 - which one is false at runtime, named here).
         if (std.c.getenv("TF_REUSE_LOG")) |v| if (v[0] != 0 and !@import("builtin").is_test) {
             std.log.info("reuse: choose L={d} resume_={} pts(n)={d} entries={d} lives.len={d}", .{ prompt.len, resume_, pts.len, st.entries.items.len, st.lives.len });
             for (st.entries.items) |e| {
@@ -995,6 +1010,10 @@ pub const Multi = struct {
         if (a.begin > 0) {
             hit = st.namedIn(a.prompt, a.begin, a.src orelse a.slot) orelse {
                 if (!@import("builtin").is_test) std.log.err("rank {d}: no kept prompt state of the {d} tokens rank 0 resumes from in slot {d}", .{ mu.w.rank, a.begin, a.src orelse a.slot });
+                // §128.27hz++++++++++++++++++++ THE DIVERGENCE INSTRUMENT: the failing rank's FACTUAL
+                // store at the miss (the leader hit, this rank missed - the entries' presence/usable
+                // and the lives' lens name which half diverged: an absent entry = the keep/remember
+                // path; a present-but-unusable one = the live/slot path).
                 if (std.c.getenv("TF_REUSE_LOG")) |v| if (v[0] != 0) {
                     std.log.info("reuse-miss: rank={d} entries={d} looking for slot={d} n={d}", .{ mu.w.rank, st.entries.items.len, a.src orelse a.slot, a.begin });
                     for (st.entries.items) |e| {
@@ -1096,6 +1115,9 @@ pub const Multi = struct {
             var i: usize = 0;
             while (i < st.entries.items.len) {
                 if (st.entries.items[i].slot == slot) {
+                    // §128.27dj: drop (remove + destroy), never bare destroy - the entry IS in the list;
+                    // a bare destroy leaves it dangling and the next drop/evict/reconcile double-frees it
+                    // (the 128.27di second-free receipt) and the held/tick/ids scans read freed memory.
                     st.drop(st.entries.items[i]);
                     continue;
                 }
@@ -1144,6 +1166,13 @@ pub const Multi = struct {
             .dflash, .dspark => if (mu.mdOf(a.mode) != null) a.mode else return error.NoDrafter,
         };
         if (a.flush) try mu.flushReuse();
+        // §128.27az THE POOL: the ledger reconcile + the interval claim. THE STATE IS THE LEDGER
+        // (mirrored by the same admits in the same order); the reconcile releases the intervals whose
+        // slots hold no busy stream and no kept state - lazy, deterministic, no store hooks needed.
+        // A reuse-hit's interval is REUSED AS-IS (the resume's rows intact); one that cannot fit the
+        // growth drops its kept states (the re-prefill honest). THE EVICT-OLDEST-IDLE: when no hole
+        // fits, idle kept states go oldest-first, cumulatively; NEVER an in-flight generation (busy
+        // absolute); PoolFull only when every idle is gone. No free-GB read anywhere.
         if (mu.r.set.pool_agg != null and mu.r.st.slot_rows != null) {
             try mu.poolReconcile();
             const dcp = mu.r.set.dcp;
@@ -1155,6 +1184,12 @@ pub const Multi = struct {
             if (have != 0 and L + a.count + 64 <= have * dcp) {
                 // the kept prefix's interval reused (admitReuse below reads its rows)
             } else if (have != 0 and blk: {
+                // §128.27hz++++++++ THE IN-PLACE GROWTH: the grown turn extends its own interval
+                // (the rows past its end free in the mirrored ledger) instead of dropping its kept
+                // states - the resume intact, the fill appends only the new tokens. The old path
+                // dropped (EVERY grown turn outgrows the +64 pad: 297550 > 297532 by 18 rows at the
+                // T2) and the request then died ReuseOutOfStep hunting the state its own claim had
+                // just destroyed.
                 mu.r.st.poolExtend(mu.ops(), mu.w, a.slot, need) catch break :blk false;
                 break :blk true;
             }) {
@@ -1163,6 +1198,14 @@ pub const Multi = struct {
                 mu.views[a.slot].freeView();
                 mu.views[a.slot] = try mu.r.st.slotView(mu.w, a.slot);
             } else {
+                // §128.27hz+ THE COHERENCE GATE (the claim-path PoolFull's wedge fix): the fit
+                // decided BEFORE any mutation. The drop/evict below mutate the ledger; a PoolFull
+                // after them aborts the wire's replay (the handler's refuse is the authority) and
+                // rank 0's ledger alone moves - the digests diverge and every later admit dies
+                // RanksOutOfStep (the 350K receipt at the DCP1-P4-POOL: the evict fired, the
+                // refuse followed, the serve wedged; the 128.27hv fix covered only the wire-admit
+                // refusal site, not this claim-time site). Monotone: evicting only frees, so a
+                // hole under the all-idles-evicted dry layout <=> the real oldest-first evict fits.
                 if (mu.r.st.poolHole(need) == null) {
                     var evictable: [64]bool = undefined;
                     @memset(&evictable, false);
@@ -1194,6 +1237,12 @@ pub const Multi = struct {
                 }
                 if (have != 0) {
                     try mu.poolDropKept(a.slot);
+                    // §128.27hz++++++++ THE FALLBACK'S MISSING HALF: the in-place drop killed this
+                    // slot's kept states - the resume it promised is dead. Fall back to the honest
+                    // fresh fill (begin=0): the wire still carries the old begin, but the followers
+                    // run this same drop on the same mirrored ledger and fall back alike - coherent
+                    // by construction. Without this the T2 kept begin=297441 and died
+                    // ReuseOutOfStep at 0.02s, its own claim the killer.
                     if (a.src == null and a.begin > 0) a.begin = 0;
                 }
                 var hole_at = mu.r.st.poolHole(need);
@@ -1202,6 +1251,12 @@ pub const Multi = struct {
                     hole_at = mu.r.st.poolHole(need);
                     if (hole_at == null) return error.PoolFull; // unreachable post-gate; the guard kept
                 }
+                // §128.27hq THE UNIFORM-BASE EXPERIMENT (the 128.27hp non-zero-base isolation s diagnostic
+                // arm): TF_GLM53_POOL_UNIFORM=1 forces the claim to the slot s UNIFORM base instead of the
+                // first-fit hole - IF the corruption vanishes, a reader computes slot x local internally
+                // (the uniform class confirmed, the kernel named by eliminating the BASE-correct ones); IF it
+                // persists, a BASE-taking kernel s base!=0 handling is broken (the AOT ROWS prebuilts the
+                // suspect). The claim s SIZE stays the pool s actual-usage need (the Mia semantics in size).
                 if (blk: {
                     const e = std.c.getenv("TF_GLM53_POOL_UNIFORM") orelse break :blk false;
                     break :blk e[0] != 0; // §128.27ht the empty-string trap: the launcher passes the var empty - a null-check alone fires on it
@@ -1210,6 +1265,12 @@ pub const Multi = struct {
                     if (hole_at.? + need > mu.r.st.local) return error.PoolFull;
                 }
                 try mu.r.st.poolClaim(mu.ops(), mu.w, a.slot, hole_at.?, need);
+                // §128.27ht THE STALE-VIEW FIX (the pool campaign's whole corruption, named to the line):
+                // the slot views are built ONCE at the multi s init - the ledger EMPTY, every pre-offset 0 -
+                // and never rebuilt after a claim: every fill wrote through the stale view at the PLANE S
+                // BASE, trampling slot 0 and leaving every other claim s rows unwritten (the frozen-ramp
+                // selection, the 0/86-0/140 accepts, the Mia s all-four garbage - 128.27hs/128.27hp).
+                // Rebuild the claimed slot s view from the fresh ledger.
                 mu.views[a.slot].freeView();
                 mu.views[a.slot] = try mu.r.st.slotView(mu.w, a.slot);
             }
@@ -1224,6 +1285,8 @@ pub const Multi = struct {
         errdefer mu.gpa.free(s.eos);
         s.named = try mu.gpa.dupe(u32, a.keeps);
         errdefer mu.gpa.free(s.named);
+        // §128.27hz++++++++++++++++++++++++++++++ the first mask's dupe: the stream owns its copy
+        // (the caller's wire/arena slice freed at its own scope's end)
         if (a.gmask) |m| {
             s.gmask = try mu.gpa.dupe(u32, m);
             errdefer mu.gpa.free(s.gmask);
@@ -1235,6 +1298,20 @@ pub const Multi = struct {
             s.chunks = try mu.gpa.alloc([2]usize, 1); // (L, L): a replay - the kept head row, nothing filled
             s.chunks[0] = .{ L, L };
         } else {
+            // §128.27hz++++++++++++++++++++++ THE SHAPE-STABLE FILL: the cuts carry NO stops - the pure
+            // even plan, the pre-fix form's chunk shapes EXACTLY (the old bits: the last chunk's
+            // path/kernel class never changes - a 1-row [L-1,L) tail took the plain path where cuBLAS
+            // picks kernels by M, against the old tail's SP path; the anchors moved on it). The keeps
+            // fire post-fill instead (the block at e==L below) - the entries need no chunk boundary:
+            // their rows are the live prefix, the ring clips at its own n. The stops stay on the wire
+            // (compat) but cut nothing; the followers' plans match trivially - the one-line fix's
+            // divergence class gone by construction.
+            // §128.27hz+++++++++++++++++++++++ THE RESUMED-GRID ALIGNMENT: the resumed fill's chunks
+            // are the FRESH plan's grid clipped at begin (not a new grid from begin) - the interior
+            // windows then sit at the same absolute rows the fresh fill used, the appended rows' GEMM
+            // shapes the fresh class (the resumed path's own bits-class was the bench's -3: the old
+            // 86-class bench re-prefilled every turn fresh; the resumed turns' begin-offset windows
+            // flipped four multi-turn scenarios). Only the first partial chunk keeps its own shape.
             {
                 const fresh = try rn.cutChunks(mu.gpa, 0, L, &.{}, rows, short);
                 defer mu.gpa.free(fresh);
@@ -1245,6 +1322,14 @@ pub const Multi = struct {
                     break;
                 }
                 s.chunks = try mu.gpa.alloc([2]usize, fresh.len - n_keep);
+                // §128.27hz+++++++++++++++++++++++ THE TAIL-RECOMPUTE (the ruling's path (c)): the
+                // chunks taken WHOLE - no clip at begin. The first chunk re-fills from its true
+                // grid start (<= begin), overwriting the kept rows with IDENTICAL bits, so every
+                // chunk's shape is exactly the fresh fill's and the appended rows' bits are the
+                // fresh class - the exact-bits resume (the sub-chunk prompts re-fill whole: no
+                // savings, the 86's honest price; the big grown turns re-fill only the tail:
+                // 344s -> ~4s, the prize held). The kept carry0 stays unconsumed: the re-filled
+                // first chunk rebuilds the MTP state from its own start.
                 for (fresh[n_keep..], 0..) |c, i| {
                     s.chunks[i] = c;
                 }
@@ -1318,6 +1403,11 @@ pub const Multi = struct {
         if (mu.filling.items.len == 0) return error.OutOfStep;
         const s = mu.filling.items[0];
         if (s.sid != sid) return error.OutOfStep;
+        // §128.27hz+++++++++++++++ THE INFINITE-FILL INSTRUMENT: the per-chunk state (the stuck
+        // point named in one run — the ci not advancing = the chunk loop; the ci past the end =
+        // the queue's removal; the ci advancing with e stuck = the chunk plan's consumption).
+        // §128.27hz++++++++++++++++++++ THE RANK GATE LIFTED: the followers' fills were invisible
+        // at the wedge hunt (the rank-0-only gate) — both sides' chunk plans now line-comparable.
         if (std.c.getenv("TF_REUSE_LOG")) |v| if (v[0] != 0 and !@import("builtin").is_test) {
             const ch = if (s.ci < s.chunks.len) s.chunks[s.ci] else .{ s.chunks[s.ci -| 1][1], s.chunks[s.ci -| 1][1] };
             std.log.info("fill: sid={d} ci={d}/{d} chunk=[{d},{d}) L={d} q={d} rank={d} mode={d}", .{ sid, s.ci, s.chunks.len, ch[0], ch[1], s.prompt.len, mu.filling.items.len, mu.w.rank, @intFromEnum(s.mode) });
@@ -1335,6 +1425,9 @@ pub const Multi = struct {
             if (s.carry0) try mu.ops().copy(r.carry.ptr, mu.carry0.ptr + s.slot * mu.D * 2, mu.D * 2);
             s.carry0 = false;
             s.ci += 1;
+            // §128.27hz++++++++++++++++++++++++++++++ THE REPLAY'S MASKED PICK: the kept head row
+            // read in place (pickMasked takes any row address — no copy, no records round-trip);
+            // the free-form arm keeps replayHead's own form
             const tok = if (s.gmask.len > 0)
                 try r.pickMasked(mu.head0.ptr + s.slot * mu.V * 4, s.gmask)
             else
@@ -1357,6 +1450,14 @@ pub const Multi = struct {
         const hb = try r.prefillChunk(&mu.views[s.slot], s.prompt, a, e, s.ci, head);
         if (mu.mdOf(s.mode)) |x| try x.feedPrompt(&r.pb, s.slot, a, e, L); // multi._chunk: dr.commit(the chunk's taps)
         s.ci += 1;
+        // §128.27hz++++++++++++++++++++++ THE SHAPE-STABLE KEEPS (post-fill): the fill's cuts carry no
+        // stops (the even plan, the old bits), so the named points never surface as chunk ends - the
+        // entries build HERE, at the prompt's end: the ids are the prompt's prefix, the rows the live
+        // prefix (no boundary needed, no copy), the ring clipped at its own n (saveWindow takes n),
+        // the carry the end-carry (the drafter's init only - off by the point's distance from L,
+        // self-healing within a round; the verify guarantees the OUTPUT bits regardless). The entry
+        // SET is unchanged from the mid-fill form: the keeps list was always the <=4 cutAndKeep
+        // points (the last stop, the system point, the fork) - the stride cuts never had keeps.
         if (mu.store != null and s.mode != .serial and e == L) {
             for (s.named) |enc| {
                 const p = enc >> 1;
@@ -1369,6 +1470,11 @@ pub const Multi = struct {
             p.total(r.w.rank, L);
             p.on = false;
         }
+        // §128.27hz++++++++++++++++++++++++++++++ THE FILL'S MASKED FIRST PICK: a structured
+        // stream's first token drawn from the head row's GRAMMAR-ALLOWED best (the fused head's
+        // top-1 record is insufficient when the grammar forbids it). The mask came with the admit
+        // (the walk's root fill — prompt-independent), so EVERY rank's fill replays the same
+        // masked draw: the pick's own gather stays a collective, the ranks never desert it.
         const tok = if (s.gmask.len > 0)
             try r.pickMasked(hb.?.lg, s.gmask)
         else
@@ -1394,6 +1500,10 @@ pub const Multi = struct {
         if (mu.store) |*st| try st.setLiveSlot(s.slot, s.prompt);
         s.started = true;
         s.t_start = mu.now();
+        // §128.27dp THE CHECKSUM DISCRIMINATOR (the kv8debug precedent): the fill just wrote the whole
+        // prompt's KV into the slot's interval - per-row byte checksums of layer 0's plane at the view's
+        // rows (the written span and the claim-zeroed tail) name the broken tensor: rows zero at slot >= 1
+        // => the write never landed; rows sane but the output garbage => the read side.
         if (fw.wdebug_on and s.P >= 16) {
             const o = mu.ops();
             const view = mu.views[s.slot];
@@ -1538,6 +1648,9 @@ pub const Multi = struct {
                 if (s.isEnd(t)) break;
             }
             mu.takeTokens(s, new[0..nn]);
+            // §128.27by (I) THE COUNT-FREEZE LATCH: at out.len >= count the token loop above breaks
+            // empty and takeTokens early-returns on the empty batch - the done latch inside it never
+            // fired and the stream rounded forever, unreaped (the re-base pair's 900 s hang).
             if (!s.done and s.out.items.len >= s.count) {
                 s.done = true;
                 if (s.t_end == 0) s.t_end = mu.now();
@@ -1628,6 +1741,8 @@ pub const Multi = struct {
             }
         }.f;
         if (!@import("builtin").is_test) std.log.info("glm53 prof rank {d}: rounds={d} streams={d} sampled={d} drafting={d} cut={d} rows={d:.2} | propose={d:.2} mtp={d:.2} cut={d:.2} verify={d:.2} picks={d:.2} commit={d:.2} total={d:.2} wait={d:.2} ms/round", .{ mu.w.rank, p.n, p.key & 0xff, (p.key >> 8) & 0xff, (p.key >> 16) & 0xff, (p.key >> 24) & 0xff, @as(f64, @floatFromInt(p.rows)) / n, ms(p.acc[0], n), ms(p.acc[1], n), ms(p.acc[2], n), ms(p.acc[3], n), ms(p.acc[4], n), ms(p.acc[5], n), ms(p.total, n), ms(p.wait, n) });
+        // 128.27fy THE VERIFY-INTERNALS PRINT SEAT: the forward-prof's marks fire on the verify's live
+        // (eager) compute too - dump the decode windows' accumulated phase table beside the round line.
         if (mu.r.f.prof) |fp| {
             if (fp.used > 0 and fp.on) fp.report(mu.w.rank, fp.chunks, 0, 0, 0) catch {};
         }
@@ -1718,6 +1833,10 @@ pub const Multi = struct {
         var sampled = false;
         for (plan.items[0..plan.n]) |it| sampled = sampled or it.sampled != 0;
         try mu.verify(t.R, T, if (sampled) .local else .argmax);
+        // §128.27hs THE ROUND DUMP (the read-dump instrument, the 128.27hp two-needle class s decisive
+        // act): TF_GLM53_ROUND_DUMP=1 - the first observable pipeline OUTPUT (the selection s TOK columns,
+        // the row s top-k of the scored keys) + the round s own tables, diffed against the CLAIMED
+        // interval at the reproducer: the columns must lie in [0, the stream s filled rows), base-relative.
         if (mu.w.rank == 0 and std.c.getenv("TF_GLM53_ROUND_DUMP") != null and !@import("builtin").is_test) {
             round_dump_n += 1;
             if (round_dump_n <= 60) {
@@ -1842,12 +1961,23 @@ pub const Multi = struct {
             const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch break :blk mu.rows;
             break :blk if (n == 0) mu.rows else @min(mu.rows, n);
         };
+        // §128.27gy THE BUCKET TRIM (the min-graphs lane's bucket arm): TF_GLM53_GRAPH_MIN_BUCKET=P
+        // skips the prewarm of the position buckets below P (and the null bucket when P > 0) - at a
+        // max-context serve the fills live in the top rungs and the low ladder is dead boot weight
+        // (the 2x600K receipts: the walk starts at 7.11 GiB free, the low rungs ~1.1 GiB each). A
+        // missed bucket captures on demand into the traffic's own support - the same philosophy as
+        // the GRAPH_MAX_ROWS width cap; the e=0 gate holds for every prewarmed round. The projection
+        // counts the kept rungs only - the two move together or the budget gate lies.
         const min_bucket: usize = blk: {
             const v = std.c.getenv("TF_GLM53_GRAPH_MIN_BUCKET") orelse break :blk 0;
             break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
         };
         var kept: usize = 0;
         for (bks) |T| {
+            // §128.27hg THE NULL RUNG ALWAYS KEPT: the shallow traffic's home - trimming it forces the
+            // null-bucket rounds through the mid-serving on-demand capture (the e=7 receipt at the 600K
+            // form, the 94%-acceptance anomaly's candidate seat: the eager-to-captured transition's
+            // state, the 126.6(am) resync's runtime absence). The null rung costs 16 graphs (~0.32 GiB).
             if (min_bucket == 0 or T == null or (T orelse 0) >= min_bucket) kept += 1;
         }
         const est_graphs = kept * (mtp_per_bucket + 2 * graph_max_rows) + 11;
@@ -2076,6 +2206,8 @@ pub const Multi = struct {
             for (0..d) |j| drafts[j] = @intCast(ids[off + 1 + j]);
             var pk: [fw.decode_rows]u32 = undefined;
             const s = mu.find(it.sid).?;
+            // §128.27ah: every row's draw first (the v2 seam's adapter reads them before the chain cut; the
+            // extra host-side chooses past a mismatch are dead values - smp.choose is pure, no state)
             for (0..1 + d) |j| {
                 if (!sampled) {
                     pk[j] = @intCast(amax[off + j]);
@@ -2117,6 +2249,7 @@ pub const Multi = struct {
             for (plan.items[0..plan.n], 0..) |it, i| {
                 const m = modeOfWord(it.mode) orelse return error.OutOfStep;
                 if ((drafterOf(m) orelse continue) != which) continue;
+                if (if (mu.find(it.sid)) |ms| ms.failed != null else false) continue; // §the isolation: a dead stream commits nothing
                 items[ni] = .{ .slot = it.slot, .src = vb.taps + t.offs[i] * pitch, .n = res[i].n + 1 };
                 ni += 1;
             }
@@ -2138,9 +2271,29 @@ pub const Multi = struct {
         for (plan.items[0..plan.n], 0..) |it, i| {
             if (it.grammar == 0) continue; // the item's flag is the truth; the mask the payload
             const m = plan.masks[i] orelse return error.OutOfStep;
+            // §128.27hz++++++++++++++++++++++++++++++++ the wedge hunt's instrument: the hook's
+            // entry per masked item (before the collective gather)
             std.log.info("maskPicks: i={d} sid={d} grammar={d}", .{ i, it.sid, it.grammar });
             const row = mu.vb.lg + @as(u64, t.offs[i]) * mu.V * 4;
-            const tok = try mu.r.pickMasked(row, m);
+            const tok = mu.r.pickMasked(row, m) catch |e| {
+                // §THE PER-STREAM ISOLATION: GrammarDead is the COLLECTIVE's verdict — every
+                // rank's reduce returns null over the same gathered bytes, so every rank marks
+                // its own copy of the stream identically, skips its commit and state advance,
+                // and the round continues for the mates. The stream's lane side dies alone: its
+                // frozen pending returns as the next draw and the walk rejects it at the dead
+                // position (the existing per-stream rejection — never a round error). Any other
+                // error is round-level (the exchange, the channel) and propagates, as it must.
+                if (e == error.GrammarDead) {
+                    if (mu.find(it.sid)) |ms| {
+                        if (ms.failed == null) {
+                            ms.failed = e;
+                            std.log.warn("maskPicks: sid={d} grammar dead — the stream ends alone, the round continues", .{it.sid});
+                        }
+                    }
+                    continue;
+                }
+                return e;
+            };
             std.log.info("maskPicks: sid={d} picked={d}", .{ it.sid, tok }); // §128.27hz
             res[i].n = 0;
             res[i].len = 1;
@@ -2160,6 +2313,7 @@ pub const Multi = struct {
         const tok = mu.pinSlice(i64, l.ctok, mu.rows);
         for (plan.items[0..plan.n], 0..) |it, i| {
             if (it.mode != @backingInt(Mode.mtp)) continue;
+            if (if (mu.find(it.sid)) |ms| ms.failed != null else false) continue; // §the isolation: a dead stream commits nothing
             const x = &res[i];
             for (0..x.n + 1) |q| {
                 idx[c] = @intCast(t.offs[i] + q);
@@ -2317,7 +2471,7 @@ test "Phase 4c: drafter streams' windows take the host's drafts; MTP streams kee
     try std.testing.expectEqualSlices(i64, &.{6}, t.vdst[0][0..1]);
     // more drafts than the room asked: out of step
     dd.n[0] = 8;
-    try std.testing.expectError(error.Invalid, tables(&p, 2, 3, 1000, &dd));
+    try std.testing.expectError(error.Invalid, tables(&p, 2, 3, 1000, null, &dd));
 }
 
 test "Phase 4c: modes, the drafter rows and the window with drafters" {

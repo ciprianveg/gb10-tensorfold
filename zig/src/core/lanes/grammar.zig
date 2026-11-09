@@ -296,6 +296,10 @@ pub const Constraint = struct {
 
     fn take(c: *Constraint, token: u32) !bool {
         if (c.pre_taken) |p| {
+            // §128.27hz++++++++++++++++++++++++++++++++++++ THE PRE-TAKE CONSUMPTION: the hook's
+            // own transition — the pick and the validation were ONE call; no second matcher read,
+            // no drift window. A different token (the res diverged): undo the pre-take, judge
+            // honestly below.
             c.pre_taken = null;
             if (p == token) return true;
             c.rules.vtable.rollback(c.rules.ptr, 1) catch {};
@@ -306,7 +310,10 @@ pub const Constraint = struct {
         }
         if (c.rules.vtable.terminated(c.rules.ptr)) return true;
         const ok = try c.rules.vtable.accept(c.rules.ptr, token);
-        if (!ok) std.log.err("grammar: accept({d}) refused at the active walk (after={?d})", .{ token, c.after });
+        // §128.27hz++++++++++++++++++++++++++++++++ THE HUNT'S REFUSAL LOG (the transition-round
+        // rejection): a masked pick refused by the walk — the state diverged between the fill and
+        // the accept. Retires with the fix.
+        if (!ok) std.log.warn("grammar: accept({d}) refused at the active walk (after={?d})", .{ token, c.after });
         return ok;
     }
 
@@ -323,7 +330,7 @@ pub const Constraint = struct {
         if (c.rules.vtable.terminated(c.rules.ptr)) return true;
         const ok = try c.rules.vtable.accept(c.rules.ptr, token);
         if (!ok) {
-            std.log.err("grammar: preTake({d}) refused — the walk rejects its own fill's pick", .{token});
+            std.log.warn("grammar: preTake({d}) refused — the walk rejects its own fill's pick", .{token});
             return false;
         }
         c.pre_taken = token;
@@ -611,4 +618,102 @@ test {
     _ = @import("grammar_error_test.zig");
     _ = @import("grammar_handoff_test.zig");
     _ = @import("grammar_budget_test.zig");
+}
+
+// §The pre-take protocol's unit classes: the one transition, executed. The stub counts the
+// matcher's accept and rollback calls — the consumption's "no second matcher call" is an
+// assertion on the counter, not a claim in a comment.
+
+const Counting = struct {
+    accepts: usize = 0,
+    rollbacks: usize = 0,
+    done: bool = false,
+
+    fn accept(p: *anyopaque, token: u32) anyerror!bool {
+        const s: *Counting = @ptrCast(@alignCast(p));
+        s.accepts += 1;
+        return token % 2 == 0; // even tokens pass, odd refuse
+    }
+    fn rollback(p: *anyopaque, n: usize) anyerror!void {
+        const s: *Counting = @ptrCast(@alignCast(p));
+        s.rollbacks += n;
+    }
+    fn terminated(p: *anyopaque) bool {
+        const s: *Counting = @ptrCast(@alignCast(p));
+        return s.done;
+    }
+    fn fill(p: *anyopaque, words: []u32) anyerror!void {
+        _ = p;
+        for (words) |*w| w.* = 0;
+    }
+    fn drafts(p: *anyopaque, out: []u32) anyerror!usize {
+        _ = p;
+        _ = out;
+        return 0;
+    }
+    fn free(p: *anyopaque) void {
+        _ = p;
+    }
+
+    fn rules(s: *Counting) Rules {
+        return .{ .ptr = s, .vtable = &.{ .accept = accept, .rollback = rollback, .terminated = terminated, .fill = fill, .drafts = drafts, .free = free } };
+    }
+};
+
+test "the pre-take and the commit are ONE transition: the consumed token never re-judges" {
+    var m = Counting{};
+    var c = Constraint.init(m.rules(), 4, null);
+    // the pre-take: ONE matcher call, the hold set
+    try std.testing.expect(try c.preTake(4));
+    try std.testing.expectEqual(@as(usize, 1), m.accepts);
+    try std.testing.expectEqual(@as(?u32, 4), c.pre_taken);
+    // the commit consumes the hold: the same token, ZERO further matcher calls
+    try std.testing.expect(try c.take(4));
+    try std.testing.expectEqual(@as(usize, 1), m.accepts); // the one-transition proof, on the counter
+    try std.testing.expectEqual(@as(?u32, null), c.pre_taken);
+    try std.testing.expect(c.active);
+}
+
+test "a divergent commit token rolls the pre-take back and is judged honestly" {
+    var m = Counting{};
+    var c = Constraint.init(m.rules(), 4, null);
+    try std.testing.expect(try c.preTake(4));
+    // the res diverged: the hold is undone (ONE rollback), the new token judged on its own
+    try std.testing.expect(try c.take(6));
+    try std.testing.expectEqual(@as(usize, 1), m.rollbacks);
+    try std.testing.expectEqual(@as(usize, 2), m.accepts); // the pre-take's, then the honest judge's
+    // and a divergent ODD token is refused
+    var m2 = Counting{};
+    var c2 = Constraint.init(m2.rules(), 4, null);
+    try std.testing.expect(try c2.preTake(4));
+    try std.testing.expect(!try c2.take(7));
+}
+
+test "the pre-take's refusal is honest at the pick's own site and holds nothing" {
+    var m = Counting{};
+    var c = Constraint.init(m.rules(), 4, null);
+    try std.testing.expect(!try c.preTake(5)); // odd: the walk rejects its own fill's pick
+    try std.testing.expectEqual(@as(usize, 1), m.accepts);
+    try std.testing.expectEqual(@as(?u32, null), c.pre_taken); // nothing held
+}
+
+test "the gate's phases: an inactive pre-take touches no matcher, and the terminated grammar takes anything" {
+    // thinking on: the grammar starts after `after` — the pre-take before the gate is a no-op pass
+    var m = Counting{};
+    var c = Constraint.init(m.rules(), 4, 30);
+    try std.testing.expect(!c.active);
+    try std.testing.expect(try c.preTake(999));
+    try std.testing.expectEqual(@as(usize, 0), m.accepts);
+    try std.testing.expectEqual(@as(?u32, null), c.pre_taken); // the commit's follow re-gates
+    // the gate itself: only `after` activates
+    try std.testing.expect(try c.take(29));
+    try std.testing.expect(!c.active);
+    try std.testing.expect(try c.take(30));
+    try std.testing.expect(c.active);
+    // terminated: both sites pass without the matcher
+    m.done = true;
+    try std.testing.expect(try c.preTake(5));
+    try std.testing.expect(try c.take(5));
+    // the gate's takes and the terminated passes never reach the matcher: zero accept calls all told
+    try std.testing.expectEqual(@as(usize, 0), m.accepts);
 }

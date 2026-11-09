@@ -186,11 +186,11 @@ test "a failed shared keep reaps an already finished stream before freeing its j
     try host.start();
     var stopped = false;
     defer if (!stopped) host.stop();
-    try std.testing.expectEqual(@as(?Reason, .failed), short.waitFor(2000));
+    try std.testing.expectEqual(@as(?Reason, .length), short.waitFor(2000)); // §the second window's receipt (2026-11-09): the round-fail path no longer nukes every admitted job — the FINISHED stream (the ultimate innocent: its generation complete) delivers its reply; only the live participant fails
     try std.testing.expectEqual(@as(?Reason, .failed), long.waitFor(2000));
     host.stop();
     stopped = true;
-    try std.testing.expectEqualStrings("GpuFailed", short.message);
+    try std.testing.expectEqualStrings("", short.message);
     try std.testing.expectEqualStrings("GpuFailed", long.message);
     try std.testing.expectEqual(@as(usize, 1), short.finishes);
     try std.testing.expectEqual(@as(usize, 1), long.finishes);

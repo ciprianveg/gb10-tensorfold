@@ -321,3 +321,68 @@ test "master addresses" {
     try std.testing.expectError(error.BadAddress, parseMaster("10.100.10:1"));
     try std.testing.expectError(error.BadAddress, parseMaster("spark1"));
 }
+
+// §The masked pick's exchange, tested over a REAL loopback pair (the structured-verify window's
+// failure, receipted 2026-11-09: a max_world-sized buffer at world 8 violated allGather's size
+// contract and every rank errored BadPeer before any socket I/O — silently, the fleet's masked
+// round dead in 0.87 s, no channel error anywhere). Rank 0 accepts (it blocks), so it runs in a
+// thread; rank 1's connect retries until the listen is up.
+
+const Loopback = struct {
+    io: std.Io,
+    ip: u32,
+    port: u16,
+    rank: usize,
+    out: Rendezvous = undefined,
+    err: ?anyerror = null,
+
+    fn openSide(s: *@This()) void {
+        s.out = Rendezvous.open(s.io, s.ip, s.port, s.rank, 2, 30.0) catch |e| {
+            s.err = e;
+            return;
+        };
+    }
+};
+
+test "allGather over a real loopback pair: the size contract is the gate, the gathered bytes identical" {
+    const port: u16 = 47331; // the test's own; REUSEADDR tolerates a stray TIME_WAIT
+    const ip = try parseIp4("127.0.0.1");
+    var r0: Loopback = .{ .io = std.testing.io, .ip = ip, .port = port, .rank = 0 };
+    const accept_thread = try std.Thread.spawn(.{}, Loopback.openSide, .{&r0});
+    var r1: Loopback = .{ .io = std.testing.io, .ip = ip, .port = port, .rank = 1 };
+    Loopback.openSide(&r1);
+    accept_thread.join();
+    if (r0.err) |e| {
+        if (e == error.BindFailed) return error.SkipZombieTest; // a stray listener owns the port
+        return e;
+    }
+    if (r1.err) |e| return e;
+    defer r0.out.close();
+    defer r1.out.close();
+
+    // THE REGRESSION: a max_world-sized buffer at world 2 (the window's exact class) violates
+    // all.len == world * mine.len and errors BadPeer BEFORE any socket I/O
+    const mine: [4]u32 = .{ @bitCast(@as(f32, 1.0)), @bitCast(@as(f32, @floatFromInt(@as(u32, 256)))), 1, 0 };
+    var oversize: [max_world * 4]u32 = undefined;
+    try std.testing.expectError(error.BadPeer, r0.out.allGather(std.mem.sliceAsBytes(&mine), std.mem.sliceAsBytes(&oversize)));
+    try std.testing.expectError(error.BadPeer, r1.out.allGather(std.mem.sliceAsBytes(&mine), std.mem.sliceAsBytes(&oversize)));
+
+    // the contract kept: the world-sized slice gathers, and both sides end with identical bytes
+    var all0: [2 * 4]u32 = undefined;
+    var all1: [2 * 4]u32 = undefined;
+    const r1rec: [4]u32 = .{ @bitCast(@as(f32, 2.0)), @bitCast(@as(f32, @floatFromInt(@as(u32, 512)))), 1, 0 };
+    var g0err: ?anyerror = null;
+    const gather_thread = try std.Thread.spawn(.{}, struct {
+        fn run(r: *Rendezvous, m: []const u8, a: []u8, err: *?anyerror) void {
+            r.allGather(m, a) catch |e| {
+                err.* = e;
+            };
+        }
+    }.run, .{ &r0.out, std.mem.sliceAsBytes(&mine), std.mem.sliceAsBytes(&all0), &g0err });
+    r1.out.allGather(std.mem.sliceAsBytes(&r1rec), std.mem.sliceAsBytes(&all1)) catch |e| return e;
+    gather_thread.join();
+    if (g0err) |e| return e;
+    try std.testing.expectEqualSlices(u32, &all0, &all1); // bit-identical on both ranks
+    try std.testing.expectEqualSlices(u32, all0[0..4], &mine); // rank 0's own record at its offset
+    try std.testing.expectEqualSlices(u32, all0[4..8], &r1rec); // rank 1's record lands at rank 1's offset
+}

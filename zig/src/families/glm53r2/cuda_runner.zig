@@ -37,6 +37,9 @@ const draft = @import("cuda_draft.zig");
 const dlogmod = @import("draft_log.zig");
 const dhost = @import("draft_host.zig");
 const copies = @import("copies.zig");
+const gp = @import("grammar_pick.zig");
+
+var masked_pick_logged = false; // the wedge-hunt's successor mark: the first structured pick's transport, once per process
 
 pub const Settings = struct {
     /// MTP drafts a round the buffers and graphs are built for (a request may ask fewer; 0: serial only)
@@ -92,6 +95,10 @@ pub const Settings = struct {
     kv8: bool = false,
     /// 119.2: the v3 row (656 B: the rope bf16 exact, a scale a 128-element latent block).
     kv8_v3: bool = false,
+    /// §The structured pick's transport: the boot's rendezvous channel (host TCP), for the masked pick's
+    /// record exchange — grammar_pick.zig's ruling: no EAGER GPU-side collective mid-round (the RoCE-poison
+    /// receipts; the captured graphs own every proven one). The engine passes its open Rendezvous.
+    rdv: ?*cuda.rendezvous.Rendezvous = null,
 };
 
 /// What drafts a request's rounds (runner.set_mode: the MTP head, DSpark, DFlash2).
@@ -348,6 +355,8 @@ pub const Runner = struct {
         r.solo_feed = true;
         const shared = f.shared_experts;
         if (set.pool_agg) |agg| {
+            // §128.27az THE POOL: the plane pre-sized at the config's max AGGREGATE (this rank's
+            // rows); the slots' boundaries are the Multi's ledger (admit/evict) - see cuda_multi.zig.
             r.st = try fw.State.initPoolV3(gpa, d, w, (agg + set.dcp - 1) / set.dcp + 1, set.dcp, set.slots, set.kv8, set.kv8_v3);
         } else {
             r.st = try fw.State.initSlotsKv8V3(gpa, d, w, capacity, set.dcp, set.slots, set.kv8, set.kv8_v3);
@@ -511,6 +520,11 @@ pub const Runner = struct {
         fn go(c: @This()) !void {
             // 125.43(d): the dispatch cell at the capture - the argmax-keyed graph freezes the lane
             // branch, the local-keyed cuBLAS; the replays replay the frozen branch.
+            // 126.6n THE FIX: (a) the env VALUE decides (not presence); (b) the cell is
+            // VERIFY-SCOPED - restored to true after the compute so the decode/draft dense windows
+            // ALWAYS take the lane (DENSE_LANE=1): the drafter's numerics must match the verify's
+            // lane class or the deep chains' acceptance collapses (the tech-cell regression's
+            // mechanism - the four-boot bisect's launcher default "1" had the dispatch on).
             const dispatch = laneDispatch();
             if (c.r.f.lane_pick) |p| {
                 if (dispatch) p.* = (c.pick == .argmax);
@@ -633,6 +647,9 @@ pub const Runner = struct {
             try dr.resetAt(r.ops(), 0);
         }
         try r.calibrate();
+        // 126.6(am): the prewarm's phase-boundary epoch re-sync (the boot-phase transitions: the
+        // prompt step and the drafter/calibration phases meet the decode captures here) - any
+        // divergence self-heals before the first captured replay.
         if (r.f.fast) |roc| {
             if (r.f.comm) |cm| {
                 var a = try cuda.DeviceBuffer.alloc(r.d, 128);
@@ -1096,36 +1113,49 @@ pub const Runner = struct {
         const row = try r.gpa.alloc(f32, V);
         defer r.gpa.free(row);
         try o.download(std.mem.sliceAsBytes(row), lg);
+        // The row complete on the host before the read — the ONLY sync of this path: the record is built and
+        // reduced on the host (grammar_pick.zig), so the copy-engine race and its fence retired with the
+        // device record (no H2D upload, nothing for a device gather to read stale).
         try r.f.s.synchronize();
-        var bv: f32 = -std.math.inf(f32);
-        var bi: u32 = 0;
-        var any = false;
-        for (row, 0..) |v, j| {
-            const gid = r.w.vocab_off + j;
-            // lanes.grammar.allows' form, inlined (the runner carries no lanes dep)
-            const word = gid / 32;
-            if (word >= mask.len or (mask[word] >> @intCast(gid % 32)) & 1 != 1) continue;
-            if (!any or v > bv) {
-                bv = v;
-                bi = @intCast(gid);
-                any = true;
-            }
+        // The local masked argmax over this rank's vocab share; a row that allows nothing still exchanges
+        // (the dead record) — the collective completes on every rank, GrammarDead lands on all or none.
+        const rec = gp.record(gp.maskedArgmax(row, mask, @intCast(r.w.vocab_off)));
+        const world = r.w.world;
+        if (world <= 1) {
+            const p = gp.reduce(&rec, 1) orelse return error.GrammarDead;
+            return p.id;
         }
-        if (!any) return error.GrammarDead; // the lane's own words: a row that allows nothing is a dead grammar, never a draw
-        // the record: argmaxRec's layout, pickRank's rule — the value raw, the id as f32 (ids < 2^24)
-        var rec: [4]u32 = .{ @bitCast(bv), @bitCast(@as(f32, @floatFromInt(bi))), 0, 0 };
-        try o.upload(b.amax, std.mem.sliceAsBytes(&rec));
-        try r.f.s.synchronize();
-        _ = try r.f.smallGather(b.amax, b.amax_all, 4);
-        std.log.info("pickMasked: smallGather done", .{}); // §128.27hz the wedge hunt's instrument
-        try o.pickRank(b.amax_all, if (r.f.comm != null or r.f.fast != null) r.w.world else 1, 1, b.argmax);
-        const lay = r.pinLayout();
-        const got = r.pinSlice(i64, lay.rd, 1);
-        try o.download(std.mem.sliceAsBytes(got), b.argmax);
-        try r.f.s.synchronize();
-        try r.healthy(); // the picks' own pattern: no RoCE timeout behind this read
-        std.log.info("pickMasked: reduced winner={d}", .{got[0]}); // §128.27hz the wedge hunt's instrument
-        return @intCast(got[0]);
+        // §THE ROCE-SAFE GATHER, the redesign completed per its own intent: NO 16-byte mid-round exchange on
+        // the RoCE fast path. The only PROVEN RoCE collectives live inside the captured graphs; an EAGER one
+        // between replays is the poison class, receipted twice (the raw fast allGather timed out mid-round;
+        // the raw NCCL form wedged all eight between replays). The masked pick's gather can never be captured
+        // (the masks are host-side, per-request), so the records ride the RENDEZVOUS channel instead — host
+        // TCP, rank-0-mediated, every rank ends with the identical bytes, and grammar_pick.reduce applies
+        // pickRank's rule (max value, ties to the lowest rank) on each rank: the winner bit-identical by
+        // construction. The channel's own error set (PeerClosed, Timeout, Disagree) is the loud gate; the
+        // healthy() RoCE check retired with the device read.
+        const rdv = r.set.rdv orelse return error.NoRendezvous;
+        if (world > cuda.rendezvous.max_world) return error.TooManyRanks;
+        // THE SIZE CONTRACT (the window's failure, receipted 2026-11-09): allGather demands
+        // all.len == world * mine.len EXACTLY — a max_world-sized buffer at world 8 (256 B vs the
+        // required 128) errors BadPeer on EVERY rank, BEFORE any socket I/O, silently: the whole
+        // fleet's masked round failed in 0.87 s with no channel error anywhere. The world-sized
+        // slice holds the contract by construction.
+        var all: [cuda.rendezvous.max_world * 4]u32 = undefined;
+        const buf = all[0..world * 4];
+        rdv.allGather(std.mem.sliceAsBytes(&rec), std.mem.sliceAsBytes(buf)) catch |e| {
+            // THE LOUD GATE, made good: the window's failure printed nothing at the exchange —
+            // the contract error had no voice, and the follower loop maps any round failure to
+            // "following rank 0 ended". This log names the true cause on every rank, first.
+            std.log.err("pickMasked: the rendezvous exchange failed at world {d}: {s}", .{ world, @errorName(e) });
+            return e;
+        };
+        const p = gp.reduce(buf, world) orelse return error.GrammarDead;
+        if (!masked_pick_logged) { // the wedge-hunt's successor mark: the first structured pick, once
+            masked_pick_logged = true;
+            std.log.info("pickMasked: the rendezvous gather's first pick (world {d}, winner {d})", .{ world, p.id });
+        }
+        return p.id;
     }
 
     /// Runner.generate's `head` replay: a kept prompt end's logits row (device fp32 [vocab_part]) back into the prompt

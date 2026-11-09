@@ -100,10 +100,10 @@ pub const Scorer = struct {
         try o.fill32(s.fnormed.ptr, 0x3c003c00, s.o.head_rows * D / 2); // bf16 ~0.0078 everywhere
         try o.fill32(r.pb.normed, 0x3c003c00, 4 * D / 2);
         for (1..4) |n| {
-            for (0..10) |_| try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n);
+            for (0..10) |_| try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n, r.f.qlane, r.f.hpart8);
             try r.f.s.synchronize();
             const t0 = s.now();
-            for (0..reps) |_| try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n);
+            for (0..reps) |_| try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n, r.f.qlane, r.f.hpart8);
             try r.f.s.synchronize();
             const ms = s.since(t0) * 1e3 / @as(f64, @floatFromInt(reps));
             if (w.head_q) |hq| {
@@ -146,7 +146,7 @@ pub const Scorer = struct {
         var prng = std.Random.DefaultPrng.init(0x53 + w.rank);
         for (x) |*v| v.* = @import("cuda_weights.zig").bf16Bits(prng.random().floatNorm(f32)); // unit rows, as the final norm leaves them
         try o.upload(s.fnormed.ptr, std.mem.sliceAsBytes(x));
-        try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n);
+        try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n, r.f.qlane, r.f.hpart8);
         try o.download(s.host.bytes[0 .. n * V * 4], s.lg.ptr);
         try r.f.s.synchronize();
         const got = std.mem.bytesAsSlice(f32, s.host.bytes)[0 .. n * V];
@@ -202,7 +202,7 @@ pub const Scorer = struct {
                 const n = @min(s.o.head_rows, R - i);
                 // fused.head "local": the final norm, then this rank's logits over its vocabulary share
                 try t_.rmsnorm(r.pb.hidden + i * D * 2, D, w.final_norm, s.fnormed.ptr, D, n, D, c.eps);
-                try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n);
+                try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n, r.f.qlane, r.f.hpart8);
                 try o.download(s.host.bytes[0 .. n * V * 4], s.lg.ptr);
                 try r.f.s.synchronize();
                 s.engine_s += s.since(t0);
