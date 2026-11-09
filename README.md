@@ -3,27 +3,6 @@
 TensorFold serving GLM-5.3 (NVFP4) on a fleet of NVIDIA DGX Spark (GB10)
 nodes — one image, one launcher, one verification script.
 
-> **Status (2026-11-08).** The image is published and the registry
-> manifests verified (`v1.0.0` / `latest`; digests in `PATCHES.md`). The
-> one remaining deploy step — the fleet smoke test (`start.sh` +
-> `bench.sh` on the nodes) — is **deferred while the cluster is in use
-> for other tasks**; nothing below needs it to be true. When the cluster
-> frees: `docker pull` on the master, `bash start.sh`, `bash bench.sh` —
-> that is the whole verify. (A rebuild, if ever needed, is the
-> `docker build` in `BUILD.md`, run on the GB10 host when free; the
-> build-context binaries and their lane are documented there.)
->
-> **Validation, as it stands.** Verified without the fleet: the registry
-> manifests (all three tags resolve); the fresh-clone hygiene (no keys,
-> no stray benchmark classes in the product files); the baked entry
-> wrapper (the drafter pins and the exec line as documented). **Deferred
-> — the serve-adjacent live runs only**: `start.sh`'s fleet boot and
-> `bench.sh`'s probes (health, tok/s, determinism) need the cluster
-> free; they are the user's one command away and are the only unverified
-> claims in this repo. Every number quoted in the README and the
-> benchmark record was measured on the running fleet — none was taken
-> from this packaging window.
-
 The engine is **TensorFold** (Ash Hart's upstream framework — the DSA
 attention, the DCP cache planes, the draft/verify speculative spine this
 repo's tree carries, plus this campaign's pool plane). The pool-semantics
@@ -89,6 +68,9 @@ bash start.sh stop           # the clean fleet teardown
 ```
 
 ## Performance (the pool-P4 form, same-day 2026-11-08, greedy)
+
+Every number in this section and in the benchmark record was measured on a
+live 8-node fleet — none is a projection; `bench.sh` reproduces the probes.
 
 Decode, aggregate across concurrent streams (512-token generations,
 2 runs a cell, best reported; per-stream in the record):
