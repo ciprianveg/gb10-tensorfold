@@ -2,6 +2,10 @@
 
 ## v1.0.3 — structured output landed
 
+Image: `ghcr.io/ciprianveg/gb10-tensorfold:v1.0.3` (also `latest`),
+manifest digest `sha256:09ae8af63afcff3e4627e9d3466c3b056906f3dc01668474c2a1ac87e7862a55`;
+binary class `c5cef43b…`, grammar library `1a37c255…`.
+
 **`response_format` (json_schema) and `tool_choice: "required"`/named are
 supported.** The grammar lane is real and verified: the server half
 (`response_format`/`guided_*` → the compiled Spec, the compiler handoff,
