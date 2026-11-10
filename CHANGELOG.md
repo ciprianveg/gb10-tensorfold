@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.5 — the serve entry accepts --vision
+
+The image's entry wrapper now forwards `--vision` (image input; the pack
+must carry a vision composite). Boolean flag — the wrapper forwards it
+when present instead of taking it as the model path.
+
 ## v1.0.4 — the serve entry accepts --alias and --api-key
 
 The image's entry wrapper now forwards `--alias` (extra model ids the

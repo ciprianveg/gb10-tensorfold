@@ -14,6 +14,8 @@
 #                      your clients already expect, alongside the pack's own id.
 #   --api-key KEY      the API key clients must present (Bearer or X-API-Key). Without it
 #                      the serve is open on non-loopback hosts (it warns).
+#   --vision           image input (the model pack must carry a vision composite: the
+#                      MoonViT tower + the projector beside the text weights).
 #
 # The first positional argument is the model pack path (default
 # /home/ciprian/models/models11/GLM-5.3-NVFP4-CSF) — mount the models share at boot.
@@ -39,6 +41,7 @@ PORT=5001
 PACK=/home/ciprian/models/models11/GLM-5.3-NVFP4-CSF
 ALIASES=()
 API_KEY=
+VISION=off
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -51,6 +54,7 @@ while [ $# -gt 0 ]; do
     --port) PORT="$2"; shift 2;;
     --alias) ALIASES+=("$2"); shift 2;;
     --api-key) API_KEY="$2"; shift 2;;
+    --vision) VISION=on; shift;;
     *) PACK="$1"; shift;;
   esac
 done
@@ -75,5 +79,7 @@ ALIAS_ARGS=()
 for a in "${ALIASES[@]}"; do ALIAS_ARGS+=(--alias "$a"); done
 API_ARGS=()
 [ -n "$API_KEY" ] && API_ARGS+=(--api-key "$API_KEY")
+VISION_ARGS=()
+[ "$VISION" = on ] && VISION_ARGS+=(--vision)
 exec /usr/local/bin/tensorfold-native serve "$PACK" --host 0.0.0.0 --port "$PORT" --context "$CONTEXT" --parallel "$PARALLEL" \
-  "${API_ARGS[@]}" "${ALIAS_ARGS[@]}"
+  "${API_ARGS[@]}" "${ALIAS_ARGS[@]}" "${VISION_ARGS[@]}"
