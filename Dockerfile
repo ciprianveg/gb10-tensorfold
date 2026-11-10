@@ -14,11 +14,34 @@
 # Build:  docker build -t ghcr.io/ciprianveg/gb10-tensorfold:v1.0.0 .
 # Push:   docker push ghcr.io/ciprianveg/gb10-tensorfold:v1.0.0
 
+# The --vision decoders, built at the versions the engine itself pins and verifies at
+# load (JPEG by the loaded binary's string table, WebP by WebPGetDecoderVersion):
+# libjpeg-turbo 3.1.4.1 and libwebp 1.6.0 — the releases Pillow 13.0.0 bundles, so
+# decoded pixels match the reference stack byte for byte. A throwaway stage; the
+# sonames land beside the binary on the documented loader path (bin/../lib).
+FROM ubuntu:24.04 AS decoders
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake make gcc g++ curl ca-certificates libpng-dev libjpeg-dev libtiff-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN curl -fsSL -o jpeg.tar.gz https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/3.1.4.1.tar.gz \
+ && tar xf jpeg.tar.gz \
+ && cmake -S libjpeg-turbo-3.1.4.1 -B bjpeg -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+ && cmake --build bjpeg -j"$(nproc)" \
+ && cp -L bjpeg/libturbojpeg.so.0 /out-libturbojpeg.so.0
+RUN curl -fsSL -o webp.tar.gz https://github.com/webmproject/libwebp/archive/refs/tags/v1.6.0.tar.gz \
+ && tar xf webp.tar.gz \
+ && cmake -S libwebp-1.6.0 -B bwebp -DCMAKE_BUILD_TYPE=Release -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF \
+ && cmake --build bwebp -j"$(nproc)" \
+ && cp -L bwebp/libwebpdecoder.so.3 /out-libwebpdecoder.so.3
+
 FROM ghcr.io/ciprianveg/gb10-tensorfold:base-glm53-fp8-final
 
 COPY deploy/tensorfold-native /usr/local/bin/tensorfold-native
 COPY deploy/tensorfold-serve /usr/local/bin/tensorfold-serve
 COPY deploy/libtfgrammar.so /usr/local/bin/libtfgrammar.so
+COPY --from=decoders /out-libturbojpeg.so.0 /usr/local/lib/libturbojpeg.so.0
+COPY --from=decoders /out-libwebpdecoder.so.3 /usr/local/lib/libwebpdecoder.so.3
 RUN chmod +x /usr/local/bin/tensorfold-native /usr/local/bin/tensorfold-serve /usr/local/bin/libtfgrammar.so
 
 # The grammar library is dlopen'd lazily beside the binary (candidate 2 of the
