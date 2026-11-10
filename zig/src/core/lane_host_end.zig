@@ -67,8 +67,10 @@ pub fn deliverPending(h: *LaneHost) void {
 /// ended EVERY admitted job, murdering innocent partners outside the failed round (the bench's
 /// parallel-2 pairs, identical durations). The per-stream classes never reach here anymore (the
 /// isolation marks the guilty stream and the round continues); what remains is genuinely
-/// round-level, and it takes the round's streams — the queued and the not-yet-started are spared
-/// (their own pieces fail per-job if the backend is truly unhealthy).
+/// round-level, and it takes the round's streams — the queued, the not-yet-started, and a job
+/// still filling its prompt (its stream is not in core.live, so it is not the round's to fail)
+/// are spared: a mid-fill job keeps its place in the filling list, and its own next fill step
+/// decides — per-job failure if the backend is truly unhealthy, plain resumption otherwise.
 pub fn failRound(h: *LaneHost, err: anyerror) void {
     failed(h, err);
     std.log.warn("lane host: a round failed ({s}): the round's streams fail, the rest are spared", .{@errorName(err)});
@@ -76,7 +78,6 @@ pub fn failRound(h: *LaneHost, err: anyerror) void {
     h.lock();
     var jobs = h.admitted;
     h.admitted = .empty;
-    h.filling.clearRetainingCapacity();
     h.unlock();
     defer jobs.deinit(h.gpa);
     for (jobs.items) |job| {
@@ -92,16 +93,10 @@ pub fn failRound(h: *LaneHost, err: anyerror) void {
             h.lock();
             const back = h.admitted.append(h.gpa, job);
             h.unlock();
-            if (back) |_| continue else |_| {
-                // the list is gone: fail it rather than leak a job
-                if (job.started and !job.stream.finished) h.core.discard(&job.stream);
-                h.finish(job, .failed, @errorName(err));
-                continue;
-            }
+            // the list is gone: fail it rather than leak a job
+            if (back) |_| continue else |_| {}
         }
-        // a job admitted this round has no stream yet when the planner's admitted callback fails
-        if (job.started and !job.stream.finished) h.core.discard(&job.stream);
-        h.finish(job, .failed, @errorName(err));
+        endFailed(h, job, @errorName(err));
     }
 }
 
@@ -112,14 +107,20 @@ pub fn failAll(h: *LaneHost, message: []const u8) void {
     h.lock();
     var jobs = h.admitted;
     h.admitted = .empty;
-    h.filling.clearRetainingCapacity();
     h.unlock();
     defer jobs.deinit(h.gpa);
-    for (jobs.items) |job| {
-        // a job admitted this round has no stream yet when the planner's admitted callback fails
-        if (job.started and !job.stream.finished) h.core.discard(&job.stream);
-        h.finish(job, .failed, message);
-    }
+    for (jobs.items) |job| endFailed(h, job, message);
+}
+
+/// Ends a job the backend failed: off the filling list, its stream discarded unless it already
+/// finished, the request ended with the backend's words. A job admitted this round has no stream
+/// yet when the planner's admitted callback fails.
+fn endFailed(h: *LaneHost, job: *Job, message: []const u8) void {
+    h.lock();
+    fill.unfill(h, job);
+    h.unlock();
+    if (job.started and !job.stream.finished) h.core.discard(&job.stream);
+    h.finish(job, .failed, message);
 }
 
 /// Ends every queued and admitted job cancelled (the cancellations named before it first), copying nothing.

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+A round the backend fails no longer strands a prompt that was mid-fill
+when the round died. The round's own streams still take the failure;
+a job still filling its prompt keeps its place in the filling list
+(its stream is not one the core is decoding, so it is not the round's
+to fail) and its own next fill step decides — it resumes on a healthy
+backend and fails per-job on an unhealthy one. Previously the failed
+round cleared the filling list wholesale: the mid-fill job stayed
+admitted but never filled again and never failed, holding its lane
+forever while every later request waited behind it (upstream #2727,
+ported onto this branch's round-partition `failRound`).
+
 ## v1.0.5 — the serve entry accepts --vision
 
 The image's entry wrapper now forwards `--vision` (image input; the pack
