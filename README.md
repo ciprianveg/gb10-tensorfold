@@ -196,17 +196,7 @@ receipted production configuration — change one only with a reason.
   each masked round's token pick rides a host-side rendezvous exchange
   across the ranks (sub-ms per token typical; a fully-masked long generation
   pays it per token, per stream). Free-form rounds pay nothing.
-- **Multi-turn resume trades small-turn latency for correctness.** A grown
-  conversation re-computes the tail of the kept context at the resume (the
-  exact-bits form); big turns get fast resume, small turns pay a visible
-  latency price. The trade was ruled in favor of score and determinism.
-- **Prose generation is entropy-bound around ~22-25 tok/s.** Not a defect:
-  the drafter, the KV form, and the graph lane were each tested and
-  exonerated; low-entropy prose simply accepts fewer drafts than code.
-  Code generation reads ~2x prose.
-- **Four uniform slots do not fit at DCP1.** The un-split plane's memory
-  ceiling refuses 4 uniform DCP1 slots; use the `pool-600k` arm (requests
-  claim what they need) or the DCP2 `capacity` arm for 4-stream serving.
+
 
 ## How the numbers were measured
 
