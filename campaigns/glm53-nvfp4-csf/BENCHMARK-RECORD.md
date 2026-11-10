@@ -85,6 +85,11 @@ link-bound stage; decode at these depths is link-insensitive).
 
 ## QUALITY
 
+- **Agentic tool-use** (tool-eval-bench, 69 scenarios, greedy, parallel 2, the capacity arm
+  DCP2/1.0M/450K, binary `c5cef43b`): **92/100 (★★★★★)** — structured output served
+  end-to-end (`response_format`, `tool_choice: required`), zero request errors, the fleet
+  healthy through the full run. Single-trial; the content-judgment cells move a point or
+  two run-to-run at greedy (seed variance), the capability cells are stable.
 - The needles: pristine across forms and depths to **360K+** (the varied numbered-entry class; the
   periodic-filler confound ruled out).
 - **The anchors byte-identical per layout class**: the DCP1 tier's class (3d5bc78c2333)
