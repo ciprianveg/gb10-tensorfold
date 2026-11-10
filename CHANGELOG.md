@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.4 — the serve entry accepts --alias and --api-key
+
+The image's entry wrapper now forwards `--alias` (extra model ids the
+serve answers to, repeatable) and `--api-key` (the key clients must
+present) to the native serve. Previously any unknown flag's value was
+taken as the model path — passing `--api-key <key>` made the key the
+pack path and the boot died on it.
+
 ## v1.0.3 — structured output landed
 
 Image: `ghcr.io/ciprianveg/gb10-tensorfold:v1.0.3` (also `latest`),

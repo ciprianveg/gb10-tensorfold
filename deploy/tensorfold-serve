@@ -10,6 +10,10 @@
 #   --kv8-v3 on|off    the 656B KV rows (default ON).
 #   --graphs on|off    the decode graphs (default ON — eager is measurably slower).
 #   --port N           the HTTP port (default 5001; OpenAI-compatible /v1 + /generate + /health).
+#   --alias NAME       an extra model id the serve answers to (repeatable) — e.g. the name
+#                      your clients already expect, alongside the pack's own id.
+#   --api-key KEY      the API key clients must present (Bearer or X-API-Key). Without it
+#                      the serve is open on non-loopback hosts (it warns).
 #
 # The first positional argument is the model pack path (default
 # /home/ciprian/models/models11/GLM-5.3-NVFP4-CSF) — mount the models share at boot.
@@ -33,6 +37,8 @@ KV8_V3=on
 GRAPHS=on
 PORT=5001
 PACK=/home/ciprian/models/models11/GLM-5.3-NVFP4-CSF
+ALIASES=()
+API_KEY=
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -43,6 +49,8 @@ while [ $# -gt 0 ]; do
     --kv8-v3) KV8_V3="$2"; shift 2;;
     --graphs) GRAPHS="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
+    --alias) ALIASES+=("$2"); shift 2;;
+    --api-key) API_KEY="$2"; shift 2;;
     *) PACK="$1"; shift;;
   esac
 done
@@ -63,4 +71,9 @@ if [ "$DRAFTS" = on ]; then
   export TF_GLM53_DSPARK_CONFIDENCE="${TF_GLM53_DSPARK_CONFIDENCE:-0.20}"
 fi
 
-exec /usr/local/bin/tensorfold-native serve "$PACK" --host 0.0.0.0 --port "$PORT" --context "$CONTEXT" --parallel "$PARALLEL"
+ALIAS_ARGS=()
+for a in "${ALIASES[@]}"; do ALIAS_ARGS+=(--alias "$a"); done
+API_ARGS=()
+[ -n "$API_KEY" ] && API_ARGS+=(--api-key "$API_KEY")
+exec /usr/local/bin/tensorfold-native serve "$PACK" --host 0.0.0.0 --port "$PORT" --context "$CONTEXT" --parallel "$PARALLEL" \
+  "${API_ARGS[@]}" "${ALIAS_ARGS[@]}"
