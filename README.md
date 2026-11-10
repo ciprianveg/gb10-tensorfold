@@ -55,7 +55,7 @@ pool), and `CONTEXT` (a request's claim bound).
 | Form | Shape | Use |
 |---|---|---|
 | `pool` (default) | DCP1, 4 slots, 600K shared pool, 400K a stream's max | the measured best today: 4 concurrent streams with per-request claims — c4 85.7/87.4/76.3 (code/structured/prose) |
-| `capacity` | DCP2, 4 slots — **1.05M total KV pool, 450K a stream's max context** | the split-plane form: the maximum-capacity pool — four streams claiming from 1.05M, each up to 450K deep (the boot-verified ceiling; 1.2M refuses at the fit: 2.8 GiB past the honest reserve) |
+| `capacity` | DCP2, 4 slots — **1.0M total KV pool, 450K a stream's max context** | the split-plane form: the maximum-capacity pool — four streams claiming from 1.0M, each up to 450K deep |
 
 **The pool pins and the P4 form go together**: plain DCP1/P4 *without* the
 pool refuses at the prewarm budget (139 graphs, 8.7 GiB needed vs 6.7 free —
@@ -63,7 +63,7 @@ measured 2026-11-08). For the 2-slot speed form, run `PARALLEL=2 POOL_AGG=
 bash start.sh`.
 
 ```bash
-bash start.sh capacity       # the DCP2 maximum-capacity form: the 1.05M pool
+bash start.sh capacity       # the DCP2 maximum-capacity form: the 1.0M pool
 bash start.sh stop           # the clean fleet teardown
 ```
 
@@ -146,7 +146,7 @@ delta is listed one line at a time in `PATCHES.md`:
 
 The **shared-KV pool** — max-not-division: requests claim what they
 need (first-fit, evict-oldest-idle, an honest over-cap refusal at the
-API); mixed-length streams share one aggregate (600K at DCP1/P4, 1.05M
+API); mixed-length streams share one aggregate (600K at DCP1/P4, 1.0M
 at DCP2) — is **Mia's design** (see the credits), implemented here for
 the glm53r2 engine.
 - **KV8 v3** — the 656B KV rows: exact-bf16 rope plus the latent scale
