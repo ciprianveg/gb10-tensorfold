@@ -31,7 +31,7 @@ RUN curl -fsSL -o jpeg.tar.gz https://github.com/libjpeg-turbo/libjpeg-turbo/arc
  && cp -L bjpeg/libturbojpeg.so.0 /out-libturbojpeg.so.0
 RUN curl -fsSL -o webp.tar.gz https://github.com/webmproject/libwebp/archive/refs/tags/v1.6.0.tar.gz \
  && tar xf webp.tar.gz \
- && cmake -S libwebp-1.6.0 -B bwebp -DCMAKE_BUILD_TYPE=Release -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF \
+ && cmake -S libwebp-1.6.0 -B bwebp -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF \
  && cmake --build bwebp -j"$(nproc)" \
  && cp -L bwebp/libwebpdecoder.so.3 /out-libwebpdecoder.so.3
 
